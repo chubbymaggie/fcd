@@ -26,6 +26,11 @@ bool TargetInfo::doInitialization(llvm::Module &m)
 	return ImmutablePass::doInitialization(m);
 }
 
+unsigned TargetInfo::getPointerWidth() const
+{
+	return dl->getPointerSizeInBits();
+}
+
 GetElementPtrInst* TargetInfo::getRegister(llvm::Value *registerStruct, const char *name) const
 {
 	name = largestOverlappingRegister(name);

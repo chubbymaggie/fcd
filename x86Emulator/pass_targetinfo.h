@@ -101,6 +101,8 @@ public:
 		return name;
 	}
 	
+	unsigned getPointerWidth() const;
+	
 	llvm::GetElementPtrInst* getRegister(llvm::Value* registerStruct, const char* name) const;
 	
 	const char* registerName(const llvm::Value& value) const;
