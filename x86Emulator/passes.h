@@ -33,6 +33,7 @@ AstBackEnd* createAstBackEnd();
 llvm::FunctionPass* createRegisterPointerPromotionPass();
 RegisterUse* createRegisterUsePass();
 TargetInfo* createTargetInfoPass();
+TypeInference* createTypeInferencePass();
 
 namespace llvm
 {

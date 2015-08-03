@@ -11,7 +11,7 @@
 
 #include "dumb_allocator.h"
 #include "llvm_warnings.h"
-#include "passes.h"
+#include "pass_targetinfo.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Analysis/CallGraphSCCPass.h>
@@ -54,6 +54,7 @@ namespace tie
 	public:
 		inline Category getCategory() const { return category; }
 		
+		void dump() const;
 		virtual void print(llvm::raw_ostream& os) const = 0;
 		virtual bool operator<(const TypeBase& that) const = 0;
 	};
@@ -214,18 +215,21 @@ namespace tie
 		TypeOrValue(const TypeBase* type) : value(nullptr), type(type)
 		{
 		}
+		
+		void print(llvm::raw_ostream& os) const;
+		void dump() const;
 	};
 	
 	struct Constraint
 	{
-		enum Type
+		enum Type : char
 		{
-			Specializes, // adds information (e.g. larger bit count)
-			Generalizes, // takes away information (smaller bit count)
-			IsEqual,
+			Specializes = ':', // adds information ("inherits from", larger bit count)
+			Generalizes = '!', // takes away information (smaller bit count)
+			IsEqual = '=',
 			
-			Conjunction,
-			Disjunction,
+			Conjunction = '&',
+			Disjunction = '|',
 		};
 		
 		Type type;
@@ -234,6 +238,9 @@ namespace tie
 		: type(type)
 		{
 		}
+		
+		virtual void print(llvm::raw_ostream& os) const = 0;
+		void dump();
 	};
 	
 	template<Constraint::Type ConstraintType>
@@ -244,11 +251,36 @@ namespace tie
 			return that->type == ConstraintType;
 		}
 		
+		DumbAllocator& pool;
 		PooledDeque<Constraint*> constraints;
 		
 		CombinatorConstraint(DumbAllocator& pool)
-		: Constraint(ConstraintType), constraints(pool)
+		: Constraint(ConstraintType), pool(pool), constraints(pool)
 		{
+		}
+		
+		template<typename Constraint, typename... TArgs>
+		Constraint* constrain(TArgs&&... args)
+		{
+			auto constraint = pool.allocate<Constraint>(args...);
+			constraints.push_back(constraint);
+			return constraint;
+		}
+		
+		virtual void print(llvm::raw_ostream& os) const override
+		{
+			os << '(';
+			auto iter = constraints.begin();
+			if (iter != constraints.end())
+			{
+				(*iter)->print(os);
+				for (++iter; iter != constraints.end(); ++iter)
+				{
+					os << ' ' << (char)ConstraintType << ' ';
+					(*iter)->print(os);
+				}
+			}
+			os << ')';
 		}
 	};
 	
@@ -270,6 +302,14 @@ namespace tie
 		: Constraint(ConstraintType), left(left), right(right)
 		{
 		}
+		
+		virtual void print(llvm::raw_ostream& os) const override
+		{
+			os << "value<";
+			left->printAsOperand(os);
+			os << "> " << (char)ConstraintType << ' ';
+			right.print(os);
+		}
 	};
 	
 	using SpecializesConstraint = BinaryConstraint<Constraint::Specializes>;
@@ -288,20 +328,38 @@ namespace tie
 		Constraint* constrain(llvm::Value* value, TArgs&&... args)
 		{
 			auto constraint = pool.allocate<Constraint>(value, args...);
-			constraints.insert({value, constraint});
+			addConstraintToValues(constraint, value, args...);
 			return constraint;
+		}
+		
+		template<typename... TArgs>
+		void addConstraintToValues(Constraint* c, TypeOrValue tv, TArgs&&... values)
+		{
+			addConstraintToValues(c, tv);
+			addConstraintToValues(c, values...);
+		}
+		
+		void addConstraintToValues(Constraint* c, TypeOrValue tv)
+		{
+			if (auto value = tv.value)
+			{
+				constraints.insert({value, c});
+			}
 		}
 		
 	public:
 		InferenceContext(const TargetInfo& target, llvm::MemorySSA& ssa);
 		
+		void dump() const;
+		void dump(llvm::Value* key) const;
+		
 		static const AnyType& getAny();
 		static const NoneType& getNone();
 		const IntegralType& getBoolean();
-		const IntegralType& getReg(unsigned width);
-		const IntegralType& getNum(unsigned width);
-		const IntegralType& getSint(unsigned width);
-		const IntegralType& getUint(unsigned width);
+		const IntegralType& getReg(unsigned width = 0);
+		const IntegralType& getNum(unsigned width = 0);
+		const IntegralType& getSint(unsigned width = 0);
+		const IntegralType& getUint(unsigned width = 0);
 		static const CodePointerType& getFunctionPointer();
 		static const CodePointerType& getBasicBlockPointer();
 		const IntegralType& getPointer();
@@ -322,15 +380,6 @@ namespace tie
 		void visitInstruction(llvm::Instruction& inst);
 		void visitConstant(llvm::Constant& constant);
 	};
-	
-	template<>
-	Constraint* InferenceContext::constrain<IsEqualConstraint>(llvm::Value* a, llvm::Value* b)
-	{
-		auto constraint = pool.allocate<IsEqualConstraint>(a, b);
-		constraints.insert({a, constraint});
-		constraints.insert({b, constraint});
-		return constraint;
-	}
 }
 
 class TypeInference : public llvm::CallGraphSCCPass

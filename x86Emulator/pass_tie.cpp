@@ -7,6 +7,12 @@
 //
 
 #include "pass_tie.h"
+
+SILENCE_LLVM_WARNINGS_BEGIN()
+#include <llvm/Support/raw_os_ostream.h>
+SILENCE_LLVM_WARNINGS_END()
+
+#include <iostream>
 #include <limits>
 
 using namespace std;
@@ -32,22 +38,39 @@ namespace
 	}
 }
 
-#pragma mark - Type implementation
+#pragma mark - Type Implementation
 namespace tie
 {
+	void TypeBase::dump() const
+	{
+		raw_os_ostream rerr(cerr);
+		print(rerr);
+	}
+	
+	void TypeOrValue::dump() const
+	{
+		raw_os_ostream rerr(cerr);
+		print(rerr);
+	}
+	
+	void TypeOrValue::print(llvm::raw_ostream &os) const
+	{
+		if (value == nullptr)
+		{
+			os << "type<";
+			type->print(os);
+		}
+		else
+		{
+			os << "value<";
+			value->printAsOperand(os);
+		}
+		os << '>';
+	}
+	
 	bool IntegralType::operator<(const IntegralType& that) const
 	{
-		if (tag < that.tag)
-		{
-			return true;
-		}
-		
-		if (tag > that.tag)
-		{
-			return false;
-		}
-		
-		return bitCount < that.bitCount;
+		assert(!"implement me");
 	}
 	
 	void IntegralType::print(llvm::raw_ostream &os) const
@@ -157,7 +180,7 @@ namespace tie
 		unsigned bitCount = inst.getType()->getIntegerBitWidth();
 		
 		constrain<SpecializesConstraint>(inst.getPointerOperand(), &getPointer());
-		constrain<GeneralizesConstraint>(&inst, getReg(bitCount));
+		constrain<GeneralizesConstraint>(&inst, &getReg(bitCount));
 		
 		if (auto access = mssa.getMemoryAccess(&inst))
 		if (auto def = access->getDefiningAccess())
@@ -199,15 +222,133 @@ namespace tie
 	void InferenceContext::visitCallInst(llvm::CallInst &inst)
 	{
 		// do something here
-		assert(false);
+		//assert(false);
 	}
 	
 	void InferenceContext::visitBinaryOperator(llvm::BinaryOperator &inst)
 	{
-		auto opcode = inst.getOpcode();
 		auto left = inst.getOperand(0);
 		auto right = inst.getOperand(1);
-		assert(false);
+		
+		auto opcode = inst.getOpcode();
+		// Division and modulus operations produce a result smaller or equal to the input.
+		if (opcode == BinaryOperator::SDiv || opcode == BinaryOperator::SRem || opcode == BinaryOperator::LShr)
+		{
+			constrain<SpecializesConstraint>(&inst, &getUint());
+			constrain<GeneralizesConstraint>(&inst, left);
+			constrain<GeneralizesConstraint>(&inst, right);
+		}
+		else if (opcode == BinaryOperator::UDiv || opcode == BinaryOperator::URem || opcode == BinaryOperator::AShr)
+		{
+			constrain<SpecializesConstraint>(&inst, &getSint());
+			constrain<GeneralizesConstraint>(&inst, left);
+			constrain<GeneralizesConstraint>(&inst, right);
+		}
+		else if (opcode == BinaryOperator::And)
+		{
+			// A logical AND is sometimes used to truncate integers, even signed ones and sometimes even pointers, so
+			// don't infer signedness.
+			constrain<GeneralizesConstraint>(&inst, left);
+			constrain<GeneralizesConstraint>(&inst, right);
+		}
+		else if (opcode == BinaryOperator::Add)
+		{
+			DisjunctionConstraint* disj = pool.allocate<DisjunctionConstraint>(pool);
+			
+			auto numeric = &getNum();
+			auto pointer = &getPointer();
+			// Case 1: both sides are integers
+			ConjunctionConstraint* case1 = pool.allocate<ConjunctionConstraint>(pool);
+			case1->constrain<SpecializesConstraint>(left, numeric);
+			case1->constrain<SpecializesConstraint>(right, numeric);
+			case1->constrain<SpecializesConstraint>(&inst, left);
+			case1->constrain<SpecializesConstraint>(&inst, right);
+			disj->constraints.push_back(case1);
+			
+			// Case 2: left side is a pointer, right side is an integer
+			ConjunctionConstraint* case2 = pool.allocate<ConjunctionConstraint>(pool);
+			case2->constrain<SpecializesConstraint>(left, pointer);
+			case2->constrain<SpecializesConstraint>(right, numeric);
+			case2->constrain<SpecializesConstraint>(&inst, pointer);
+			disj->constraints.push_back(case2);
+			
+			// Case 3: left side is an integer, right side is a pointer
+			ConjunctionConstraint* case3 = pool.allocate<ConjunctionConstraint>(pool);
+			case3->constrain<SpecializesConstraint>(left, numeric);
+			case3->constrain<SpecializesConstraint>(right, pointer);
+			case3->constrain<SpecializesConstraint>(&inst, pointer);
+			disj->constraints.push_back(case3);
+			
+			constraints.insert({&inst, disj});
+		}
+		// Subtracting pointers results in an integer.
+		else if (opcode == BinaryOperator::Sub)
+		{
+			// Special case for two's complement
+			auto constant = dyn_cast<ConstantInt>(left);
+			if (constant != nullptr && constant->getLimitedValue() == 0)
+			{
+				constrain<SpecializesConstraint>(right, &getSint());
+				constrain<IsEqualConstraint>(&inst, right);
+			}
+			else
+			{
+				auto numeric = &getNum();
+				auto pointer = &getPointer();
+				DisjunctionConstraint* disj = pool.allocate<DisjunctionConstraint>(pool);
+				
+				// Case 1: both sides are integers
+				ConjunctionConstraint* case1 = pool.allocate<ConjunctionConstraint>(pool);
+				case1->constrain<SpecializesConstraint>(left, numeric);
+				case1->constrain<SpecializesConstraint>(right, numeric);
+				case1->constrain<SpecializesConstraint>(&inst, left);
+				case1->constrain<SpecializesConstraint>(&inst, right);
+				disj->constraints.push_back(case1);
+				
+				// Case 2: left side is a pointer, right side is an integer
+				ConjunctionConstraint* case2 = pool.allocate<ConjunctionConstraint>(pool);
+				case2->constrain<SpecializesConstraint>(left, pointer);
+				case2->constrain<SpecializesConstraint>(right, numeric);
+				case2->constrain<SpecializesConstraint>(&inst, pointer);
+				disj->constraints.push_back(case2);
+				
+				// Case 3: both sides are pointers
+				ConjunctionConstraint* case3 = pool.allocate<ConjunctionConstraint>(pool);
+				case3->constrain<SpecializesConstraint>(left, pointer);
+				case3->constrain<SpecializesConstraint>(right, pointer);
+				case3->constrain<SpecializesConstraint>(&inst, numeric);
+				disj->constraints.push_back(case3);
+				
+				constraints.insert({&inst, disj});
+			}
+		}
+		// Special case for negation
+		else if (opcode == BinaryOperator::Xor)
+		{
+			auto constant = dyn_cast<ConstantInt>(right);
+			if (constant == nullptr)
+			{
+				constant = dyn_cast<ConstantInt>(left);
+			}
+			
+			if (constant != nullptr && constant->getValue() == constant->getType()->getMask())
+			{
+				auto nonConstant = constant == left ? right : left;
+				constrain<SpecializesConstraint>(nonConstant, &getUint());
+				constrain<IsEqualConstraint>(&inst, nonConstant);
+			}
+			else
+			{
+				constrain<SpecializesConstraint>(&inst, left);
+				constrain<SpecializesConstraint>(&inst, right);
+			}
+		}
+		// Everything else should produce an output at least as large as the input.
+		else
+		{
+			constrain<SpecializesConstraint>(&inst, left);
+			constrain<SpecializesConstraint>(&inst, right);
+		}
 	}
 	
 	void InferenceContext::visitTerminatorInst(llvm::TerminatorInst &inst)
@@ -276,3 +417,47 @@ namespace tie
 		return *pool.allocate<DataPointerType>(pointee);
 	}
 }
+
+#pragma mark - Pass Implementation
+char TypeInference::ID = 0;
+
+TypeInference::TypeInference() : CallGraphSCCPass(ID)
+{
+}
+
+const char* TypeInference::getPassName() const
+{
+	return "Type Inference";
+}
+
+void TypeInference::getAnalysisUsage(llvm::AnalysisUsage &au) const
+{
+	au.addRequired<TargetInfo>();
+	CallGraphSCCPass::getAnalysisUsage(au);
+}
+
+bool TypeInference::runOnSCC(llvm::CallGraphSCC &scc)
+{
+	assert(scc.isSingular());
+	const auto& info = getAnalysis<TargetInfo>();
+	
+	for (auto& node : scc)
+	{
+		if (auto func = node->getFunction())
+		{
+			MemorySSA mssa(*func);
+			InferenceContext ctx(info, mssa);
+			ctx.visitFunction(*func);
+		}
+	}
+	return false;
+}
+
+TypeInference* createTypeInferencePass()
+{
+	return new TypeInference;
+}
+
+INITIALIZE_PASS_BEGIN(TypeInference, "tie", "High-Level Type Inference", false, true)
+INITIALIZE_PASS_DEPENDENCY(TargetInfo)
+INITIALIZE_PASS_END(TypeInference, "tie", "High-Level Type Inference", false, true)
