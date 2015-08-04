@@ -273,12 +273,14 @@ namespace tie
 			auto iter = constraints.begin();
 			if (iter != constraints.end())
 			{
+				os << '(';
 				(*iter)->print(os);
 				for (++iter; iter != constraints.end(); ++iter)
 				{
-					os << ' ' << (char)ConstraintType << ' ';
+					os << ") " << (char)ConstraintType << " (";
 					(*iter)->print(os);
 				}
+				os << ')';
 			}
 			os << ')';
 		}
@@ -313,16 +315,17 @@ namespace tie
 	};
 	
 	using SpecializesConstraint = BinaryConstraint<Constraint::Specializes>;
-	using GeneralizesConstraint = BinaryConstraint<Constraint::Specializes>;
+	using GeneralizesConstraint = BinaryConstraint<Constraint::Generalizes>;
 	using IsEqualConstraint = BinaryConstraint<Constraint::IsEqual>;
 	
 	class InferenceContext : public llvm::InstVisitor<InferenceContext>
 	{
+		typedef std::unordered_multimap<llvm::Value*, Constraint*> ValueToConstraintMap;
 		const TargetInfo& target;
 		llvm::MemorySSA& mssa;
 		DumbAllocator pool;
 		std::unordered_set<llvm::Value*> visited;
-		std::unordered_multimap<llvm::Value*, Constraint*> constraints;
+		ValueToConstraintMap constraints;
 		
 		template<typename Constraint, typename... TArgs>
 		Constraint* constrain(llvm::Value* value, TArgs&&... args)
@@ -347,6 +350,8 @@ namespace tie
 			}
 		}
 		
+		void print(llvm::raw_ostream& os, ValueToConstraintMap::const_iterator begin, ValueToConstraintMap::const_iterator end) const;
+		
 	public:
 		InferenceContext(const TargetInfo& target, llvm::MemorySSA& ssa);
 		
@@ -365,20 +370,24 @@ namespace tie
 		const IntegralType& getPointer();
 		const DataPointerType& getPointerTo(const TypeBase& pointee);
 		
-		void visitICmpInst(llvm::ICmpInst& inst);
-		void visitAllocaInst(llvm::AllocaInst& inst);
-		void visitLoadInst(llvm::LoadInst& inst);
-		void visitStoreInst(llvm::StoreInst& inst);
-		void visitGetElementPtrInst(llvm::GetElementPtrInst& inst);
-		void visitPHINode(llvm::PHINode& inst);
-		void visitSelectInst(llvm::SelectInst& inst);
-		void visitCallInst(llvm::CallInst& inst);
+		void visitICmpInst(llvm::ICmpInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitAllocaInst(llvm::AllocaInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitLoadInst(llvm::LoadInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitStoreInst(llvm::StoreInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitGetElementPtrInst(llvm::GetElementPtrInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitPHINode(llvm::PHINode& inst, llvm::Value* constraintKey = nullptr);
+		void visitSelectInst(llvm::SelectInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitCallInst(llvm::CallInst& inst, llvm::Value* constraintKey = nullptr);
 		
-		void visitBinaryOperator(llvm::BinaryOperator& inst);
-		void visitCastInst(llvm::CastInst& inst);
-		void visitTerminatorInst(llvm::TerminatorInst& inst);
-		void visitInstruction(llvm::Instruction& inst);
+		void visitBinaryOperator(llvm::BinaryOperator& inst, llvm::Value* constraintKey = nullptr);
+		void visitCastInst(llvm::CastInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitTerminatorInst(llvm::TerminatorInst& inst, llvm::Value* constraintKey = nullptr);
+		void visitInstruction(llvm::Instruction& inst, llvm::Value* constraintKey = nullptr);
+		
 		void visitConstant(llvm::Constant& constant);
+		void visit(llvm::Instruction& inst, llvm::Value* constraintKey);
+		void visit(llvm::Instruction& inst);
+		using llvm::InstVisitor<InferenceContext>::visit;
 	};
 }
 

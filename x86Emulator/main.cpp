@@ -372,6 +372,7 @@ namespace
 		AstBackEnd* backend = createAstBackEnd();
 		legacy::PassManager outputPhase;
 		outputPhase.add(createX86TargetInfo());
+		outputPhase.add(createTypeInferencePass());
 		outputPhase.add(createStructurizeCFGPass());
 		outputPhase.add(createInstructionCombiningPass());
 		outputPhase.add(createSROAPass());
