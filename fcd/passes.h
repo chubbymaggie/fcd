@@ -35,7 +35,8 @@ SILENCE_LLVM_WARNINGS_END()
 #include <unordered_map>
 #include <unordered_set>
 
-#include "ast_backend.h"
+#include "backend.h"
+#include "pass_targetinfo.h"
 #include "pass_reguse.h"
 #include "pass_targetinfo.h"
 #include "pass_tie.h"
@@ -45,6 +46,7 @@ llvm::CallGraphSCCPass* createArgumentRecoveryPass();
 AstBackEnd* createAstBackEnd();
 llvm::FunctionPass* createRegisterPointerPromotionPass();
 RegisterUse* createRegisterUsePass();
+llvm::FunctionPass* createSESELoopPass();
 TargetInfo* createTargetInfoPass();
 TypeInference* createTypeInferencePass();
 
@@ -52,6 +54,7 @@ namespace llvm
 {
 	void initializeArgumentRecoveryPass(PassRegistry& pm);
 	void initializeAstBackEndPass(PassRegistry& pm);
+	void initializeSESELoopPass(PassRegistry& pm);
 }
 
 #endif /* defined(__x86Emulator__asaa__) */

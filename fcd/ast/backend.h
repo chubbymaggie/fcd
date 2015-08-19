@@ -1,5 +1,5 @@
 //
-// ast_backend.h
+// backend.h
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
@@ -28,9 +28,10 @@
 #ifndef program_output_cpp
 #define program_output_cpp
 
-#include "ast_function.h"
-#include "ast_grapher.h"
-#include "ast_nodes.h"
+#include "function.h"
+#include "grapher.h"
+#include "nodes.h"
+#include "pass.h"
 #include "dumb_allocator.h"
 #include "llvm_warnings.h"
 
@@ -42,6 +43,7 @@ SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Pass.h>
 SILENCE_LLVM_WARNINGS_END()
 
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -51,9 +53,17 @@ SILENCE_LLVM_WARNINGS_END()
 // Doesn't sound like a bad idea, but I don't really know where to start.
 class AstBackEnd : public llvm::ModulePass
 {
+	enum RegionType
+	{
+		NotARegion, // Entry and exit don't form a region
+		Acyclic, // Entry and exit form a region, and no node in the region goes back to the region header
+		Cyclic, // Entry and exit form a region, and at least one node in the region goes back to the region header
+	};
+	
 	std::unique_ptr<FunctionNode> output;
 	std::unique_ptr<AstGrapher> grapher;
 	std::unordered_map<const llvm::Function*, std::string> codeForFunctions;
+	std::deque<std::unique_ptr<AstPass>> passes;
 	
 	llvm::DominatorTree* domTree;
 	llvm::PostDominatorTree* postDomTree;
@@ -63,7 +73,7 @@ class AstBackEnd : public llvm::ModulePass
 	bool runOnFunction(llvm::Function& fn);
 	bool runOnLoop(llvm::Function& fn, llvm::BasicBlock& entry, llvm::BasicBlock* exit);
 	bool runOnRegion(llvm::Function& fn, llvm::BasicBlock& entry, llvm::BasicBlock* exit);
-	bool isRegion(llvm::BasicBlock& entry, llvm::BasicBlock* exit);
+	RegionType isRegion(llvm::BasicBlock& entry, llvm::BasicBlock* exit);
 	
 public:
 	static char ID;
@@ -79,6 +89,8 @@ public:
 	
 	virtual void getAnalysisUsage(llvm::AnalysisUsage &au) const override;
 	virtual bool runOnModule(llvm::Module& m) override;
+	
+	void addPass(AstPass* pass);
 	
 	std::unordered_map<const llvm::Function*, std::string> getResult() &&;
 };

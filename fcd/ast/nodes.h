@@ -1,5 +1,5 @@
 //
-// ast_nodes.h
+// nodes.h
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
@@ -24,6 +24,7 @@
 
 #include "dumb_allocator.h"
 #include "llvm_warnings.h"
+#include "not_null.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/CFG.h>
@@ -34,79 +35,9 @@ SILENCE_LLVM_WARNINGS_END()
 #include <algorithm>
 #include <string>
 
-#ifdef DEBUG
-
-// Smart pointer class to enforce that the pointer isn't null.
-template<typename T>
-struct NotNull
-{
-	friend class DumbAllocator;
-	
-	T* ptr;
-	
-	NotNull(T* ptr) : ptr(ptr)
-	{
-		assert(ptr);
-	}
-	
-	NotNull(const NotNull<T>& that) = default;
-	NotNull(NotNull<T>&& that) = default;
-	
-	NotNull<T>& operator=(const NotNull<T>& that)
-	{
-		assert(that.ptr != nullptr); // in case it's a default-constructed NotNull
-		ptr = that.ptr;
-		return *this;
-	}
-	
-	NotNull<T>& operator=(T* ptr)
-	{
-		assert(ptr);
-		this->ptr = ptr;
-		return *this;
-	}
-	
-	T* operator->() const
-	{
-		return ptr;
-	}
-	
-	T& operator*() const
-	{
-		return *ptr;
-	}
-	
-	operator T*() const
-	{
-		return ptr;
-	}
-	
-private:
-	// DumbAllocator is allowed to use the default constructor, which creates a null.
-	// This is so that it can create an array for PooledDeque.
-	NotNull() : ptr(nullptr)
-	{
-	}
-};
-
-template<typename T>
-struct llvm::simplify_type<NotNull<T>>
-{
-	typedef T* SimpleType;
-	
-	static SimpleType& getSimplifiedValue(NotNull<T>& that)
-	{
-		return that.ptr;
-	}
-};
-
-#define NOT_NULL(T) NotNull<T>
-
-#else
-#define NOT_NULL(T) T*
-#endif
-
 #pragma mark - Expressions
+class ExpressionVisitor;
+
 struct Expression
 {
 	enum ExpressionType
@@ -114,10 +45,11 @@ struct Expression
 		Value, Token, UnaryOperator, NAryOperator, Call, Cast, Numeric, Ternary,
 	};
 	
+	void print(llvm::raw_ostream& os) const;
 	void dump() const;
-	virtual void print(llvm::raw_ostream& os) const = 0;
-	virtual ExpressionType getType() const = 0;
 	
+	virtual ExpressionType getType() const = 0;
+	virtual void visit(ExpressionVisitor& visitor) = 0;
 	virtual bool isReferenceEqual(const Expression* that) const = 0;
 };
 
@@ -149,18 +81,10 @@ struct UnaryOperatorExpression : public Expression
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return UnaryOperator; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto unaryThat = llvm::dyn_cast<UnaryOperatorExpression>(that))
-		if (unaryThat->type == type)
-		{
-			return operand->isReferenceEqual(unaryThat->operand);
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 };
 
 struct NAryOperatorExpression : public Expression
@@ -220,21 +144,10 @@ struct NAryOperatorExpression : public Expression
 	
 	void addOperand(Expression* expression);
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return NAryOperator; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto naryThat = llvm::dyn_cast<NAryOperatorExpression>(that))
-		if (naryThat->type == type)
-		{
-			return std::equal(operands.cbegin(), operands.cend(), naryThat->operands.cbegin(), [](const Expression* a, const Expression* b)
-			{
-				return a->isReferenceEqual(b);
-			});
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 	
 private:
 	void print(llvm::raw_ostream& os, Expression* expression) const;
@@ -256,17 +169,10 @@ struct TernaryExpression : public Expression
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return Ternary; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto ternary = llvm::dyn_cast<TernaryExpression>(that))
-		{
-			return ifTrue->isReferenceEqual(ternary->ifTrue) && ifFalse->isReferenceEqual(ternary->ifFalse);
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 };
 
 struct NumericExpression : public Expression
@@ -292,17 +198,10 @@ struct NumericExpression : public Expression
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return Numeric; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto token = llvm::dyn_cast<NumericExpression>(that))
-		{
-			return this->ui64 == token->ui64;
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 };
 
 struct TokenExpression : public Expression
@@ -328,17 +227,10 @@ struct TokenExpression : public Expression
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return Token; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto token = llvm::dyn_cast<TokenExpression>(that))
-		{
-			return strcmp(this->token, token->token) == 0;
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 };
 
 struct CallExpression : public Expression
@@ -356,21 +248,10 @@ struct CallExpression : public Expression
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return Call; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto thatCall = llvm::dyn_cast<CallExpression>(that))
-		if (this->callee == thatCall->callee)
-		{
-			return std::equal(parameters.begin(), parameters.end(), thatCall->parameters.begin(), [](Expression* a, Expression* b)
-			{
-				return a->isReferenceEqual(b);
-			});
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 };
 
 struct CastExpression : public Expression
@@ -388,20 +269,14 @@ struct CastExpression : public Expression
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os) const override;
 	virtual inline ExpressionType getType() const override { return Cast; }
 	
-	virtual inline bool isReferenceEqual(const Expression* that) const override
-	{
-		if (auto thatCast = llvm::dyn_cast<CastExpression>(that))
-		{
-			return type->isReferenceEqual(thatCast->type) && casted->isReferenceEqual(thatCast->casted);
-		}
-		return false;
-	}
+	virtual void visit(ExpressionVisitor& visitor) override;
+	virtual bool isReferenceEqual(const Expression* that) const override;
 };
 
 #pragma mark - Statements
+class StatementVisitor;
 
 struct Statement
 {
@@ -410,9 +285,30 @@ struct Statement
 		Sequence, IfElse, Loop, Expr, Keyword, Declaration, Assignment
 	};
 	
+	void printShort(llvm::raw_ostream& os) const;
+	void print(llvm::raw_ostream& os) const;
 	void dump() const;
-	virtual void print(llvm::raw_ostream& os, unsigned indent = 0) const = 0;
+	
 	virtual StatementType getType() const = 0;
+	virtual void visit(StatementVisitor& visitor) = 0;
+};
+
+struct ExpressionNode : public Statement
+{
+	NOT_NULL(Expression) expression;
+	
+	static inline bool classof(const Statement* node)
+	{
+		return node->getType() == Expr;
+	}
+	
+	inline ExpressionNode(Expression* expr)
+	: expression(expr)
+	{
+	}
+	
+	virtual inline StatementType getType() const override { return Expr; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 struct SequenceNode : public Statement
@@ -429,13 +325,14 @@ struct SequenceNode : public Statement
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
 	virtual inline StatementType getType() const override { return Sequence; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 struct IfElseNode : public Statement
 {
-	NOT_NULL(Expression) condition;
+	ExpressionNode conditionExpression;
+	NOT_NULL(Expression)& condition;
 	NOT_NULL(Statement) ifBody;
 	Statement* elseBody;
 	
@@ -445,13 +342,12 @@ struct IfElseNode : public Statement
 	}
 	
 	inline IfElseNode(Expression* condition, Statement* ifBody, Statement* elseBody = nullptr)
-	: condition(condition), ifBody(ifBody), elseBody(elseBody)
+	: conditionExpression(condition), condition(conditionExpression.expression), ifBody(ifBody), elseBody(elseBody)
 	{
 	}
 	
-	void print(llvm::raw_ostream& os, unsigned indent, const std::string& firstLineIndent) const;
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
 	virtual inline StatementType getType() const override { return IfElse; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 struct LoopNode : public Statement
@@ -461,7 +357,8 @@ struct LoopNode : public Statement
 		PostTested, // do ... while
 	};
 	
-	NOT_NULL(Expression) condition;
+	ExpressionNode conditionExpression;
+	NOT_NULL(Expression)& condition;
 	ConditionPosition position;
 	NOT_NULL(Statement) loopBody;
 	
@@ -473,14 +370,14 @@ struct LoopNode : public Statement
 	LoopNode(Statement* body); // creates a `while (true)`
 	
 	inline LoopNode(Expression* condition, ConditionPosition position, Statement* body)
-	: condition(condition), position(position), loopBody(body)
+	: conditionExpression(condition), condition(conditionExpression.expression), position(position), loopBody(body)
 	{
 	}
 	
 	inline bool isEndless() const;
 	
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
 	virtual inline StatementType getType() const override { return Loop; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 struct KeywordNode : public Statement
@@ -500,26 +397,8 @@ struct KeywordNode : public Statement
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
 	virtual inline StatementType getType() const override { return Keyword; }
-};
-
-struct ExpressionNode : public Statement
-{
-	NOT_NULL(Expression) expression;
-	
-	static inline bool classof(const Statement* node)
-	{
-		return node->getType() == Expr;
-	}
-	
-	inline ExpressionNode(Expression* expr)
-	: expression(expr)
-	{
-	}
-	
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
-	virtual inline StatementType getType() const override { return Expr; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 struct DeclarationNode : public Statement
@@ -539,8 +418,8 @@ struct DeclarationNode : public Statement
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
 	virtual inline StatementType getType() const override { return Declaration; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 struct AssignmentNode : public Statement
@@ -558,8 +437,8 @@ struct AssignmentNode : public Statement
 	{
 	}
 	
-	virtual void print(llvm::raw_ostream& os, unsigned indent) const override;
 	virtual inline StatementType getType() const override { return Assignment; }
+	virtual void visit(StatementVisitor& visitor) override;
 };
 
 bool LoopNode::isEndless() const

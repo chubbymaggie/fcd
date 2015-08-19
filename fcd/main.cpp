@@ -41,6 +41,7 @@ SILENCE_LLVM_WARNINGS_END()
 #include <unordered_set>
 #include <sys/mman.h>
 
+#include "ast_passes.h"
 #include "capstone_wrapper.h"
 #include "executable.h"
 #include "passes.h"
@@ -48,7 +49,6 @@ SILENCE_LLVM_WARNINGS_END()
 #include "x86_register_map.h"
 
 using namespace llvm;
-using namespace llvm::object;
 using namespace std;
 
 namespace
@@ -374,15 +374,22 @@ namespace
 #endif
 		
 		// Run that module through the output pass
+		auto useAnalysis = new AstVariableReferences;
 		AstBackEnd* backend = createAstBackEnd();
+		backend->addPass(new AstFlatten);
+		backend->addPass(new AstBranchCombine);
+		backend->addPass(useAnalysis);
+		backend->addPass(new AstPropagateValues(*useAnalysis));
+		backend->addPass(new AstRemoveUndef(*useAnalysis));
+		backend->addPass(new AstFlatten);
+		backend->addPass(new AstBranchCombine);
+		backend->addPass(new AstSimplifyExpressions);
+		
 		legacy::PassManager outputPhase;
 		outputPhase.add(createX86TargetInfo());
-		outputPhase.add(createTypeInferencePass());
-		outputPhase.add(createStructurizeCFGPass());
-		outputPhase.add(createInstructionCombiningPass());
-		outputPhase.add(createSROAPass());
-		outputPhase.add(createGVNPass());
-		outputPhase.add(createCFGSimplificationPass());
+		//outputPhase.add(createTypeInferencePass());
+		outputPhase.add(createSESELoopPass());
+		outputPhase.add(createEarlyCSEPass());
 		outputPhase.add(backend);
 		outputPhase.run(module);
 		
@@ -410,6 +417,7 @@ namespace
 		initializeRegisterUsePass(pr);
 		initializeArgumentRecoveryPass(pr);
 		initializeAstBackEndPass(pr);
+		initializeSESELoopPass(pr);
 	}
 
 	const char* basename(const char* path)

@@ -1,5 +1,5 @@
 //
-// ast_simplify.h
+// ast_passes.h
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
@@ -19,13 +19,15 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef ast_simplify_cpp
-#define ast_simplify_cpp
+#ifndef ast_passes_h
+#define ast_passes_h
 
-#include "ast_nodes.h"
-#include "dumb_allocator.h"
+#include "pass.h"
+#include "pass_flatten.h"
+#include "pass_branchcombine.h"
+#include "pass_propagatevalues.h"
+#include "pass_removeundef.h"
+#include "pass_simplifyexpressions.h"
+#include "pass_variablereferences.h"
 
-Expression* wrapWithNegate(DumbAllocator& pool, Expression* toNegate);
-Statement* recursivelySimplifyStatement(DumbAllocator& pool, Statement* statement);
-
-#endif /* ast_simplify_cpp */
+#endif /* ast_passes_h */
