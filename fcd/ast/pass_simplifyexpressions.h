@@ -19,22 +19,23 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef pass_simplifyconditions_cpp
-#define pass_simplifyconditions_cpp
+#ifndef fcd__ast_pass_simplifyexpressions_h
+#define fcd__ast_pass_simplifyexpressions_h
 
 #include "pass.h"
 #include "visitor.h"
 
-class AstSimplifyExpressions : public AstPass, private ExpressionVisitor, private StatementVisitor
+class AstSimplifyExpressions final : public AstFunctionPass, private ExpressionVisitor, private StatementVisitor
 {
-	Expression* result;
+	NOT_NULL(Expression) result;
 	Expression* simplify(Expression* expr);
+	std::unordered_map<TokenExpression*, Expression*> addressesOf;
 	
-	virtual void visitIfElse(IfElseNode* ifElse) override;
-	virtual void visitLoop(LoopNode* loop) override;
-	virtual void visitKeyword(KeywordNode* keyword) override;
-	virtual void visitExpression(ExpressionNode* expression) override;
-	virtual void visitAssignment(AssignmentNode* assignment) override;
+	virtual void visitIfElse(IfElseStatement* ifElse) override;
+	virtual void visitLoop(LoopStatement* loop) override;
+	virtual void visitKeyword(KeywordStatement* keyword) override;
+	virtual void visitExpression(ExpressionStatement* expression) override;
+	virtual void visitAssignment(AssignmentStatement* assignment) override;
 	
 	virtual void visitUnary(UnaryOperatorExpression* unary) override;
 	virtual void visitNAry(NAryOperatorExpression* nary) override;
@@ -43,14 +44,17 @@ class AstSimplifyExpressions : public AstPass, private ExpressionVisitor, privat
 	virtual void visitToken(TokenExpression* token) override;
 	virtual void visitCall(CallExpression* call) override;
 	virtual void visitCast(CastExpression* cast) override;
+	virtual void visitAggregate(AggregateExpression* cast) override;
+	virtual void visitSubscript(SubscriptExpression* subscript) override;
+	virtual void visitAssembly(AssemblyExpression* assembly) override;
 	
 protected:
 	virtual void doRun(FunctionNode& fn) override;
 	
 public:
-	AstSimplifyExpressions() = default;
+	AstSimplifyExpressions();
 	
 	virtual const char* getName() const override;
 };
 
-#endif /* pass_simplifyconditions_cpp */
+#endif /* fcd__ast_pass_simplifyexpressions_h */

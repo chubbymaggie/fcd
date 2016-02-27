@@ -23,7 +23,6 @@
 
 SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/ADT/DepthFirstIterator.h>
-#include <llvm/IR/Instructions.h>
 SILENCE_LLVM_WARNINGS_END()
 
 using namespace llvm;
@@ -31,7 +30,7 @@ using namespace std;
 
 #pragma mark - AST Graph Node
 AstGraphNode::AstGraphNode(AstGrapher& grapher, Statement* node, llvm::BasicBlock* entry, llvm::BasicBlock* exit)
-: grapher(grapher), node(node), entry(entry), exit(exit)
+: grapher(grapher), entry(entry), exit(exit), node(node)
 {
 	assert(node && entry);
 }

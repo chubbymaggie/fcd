@@ -4,59 +4,105 @@
 // All Rights Reserved.
 //
 // This file is part of fcd.
-// 
+//
 // fcd is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
-// 
+//
 // fcd is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
-// 
+//
 // You should have received a copy of the GNU General Public License
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
+#include "command_line.h"
 #include "llvm_warnings.h"
+#include "main.h"
+#include "metadata.h"
+#include "params_registry.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Analysis/Passes.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Verifier.h>
-#include <llvm/Object/ObjectFile.h>
+#include <llvm/IRReader/IRReader.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/raw_os_ostream.h>
+#include <llvm/Support/SourceMgr.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/Scalar.h>
 SILENCE_LLVM_WARNINGS_END()
 
-#include <fcntl.h>
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <unistd.h>
 #include <unordered_map>
-#include <unordered_set>
-#include <sys/mman.h>
+#include <string>
+#include <vector>
 
 #include "ast_passes.h"
-#include "capstone_wrapper.h"
+#include "errors.h"
 #include "executable.h"
 #include "passes.h"
+#include "pass_python.h"
 #include "translation_context.h"
-#include "x86_register_map.h"
 
 using namespace llvm;
 using namespace std;
 
 namespace
 {
-	template<typename T, size_t N>
-	constexpr size_t countof(T (&)[N])
+	cl::opt<string> inputFile(cl::Positional, cl::desc("<input program>"), cl::Required, whitelist());
+	cl::list<unsigned long long> additionalEntryPoints("other-entry", cl::desc("Add entry point from virtual address (can be used multiple times)"), cl::CommaSeparated, whitelist());
+	cl::list<bool> partialDisassembly("partial", cl::desc("Only decompile functions specified with --other-entry"), whitelist());
+	cl::list<string> additionalPasses("opt", cl::desc("Insert LLVM optimization pass; a pass name ending in .py is interpreted as a Python script"), whitelist());
+	cl::opt<bool> inputIsModule("module-in", cl::desc("Input file is a LLVM module"), whitelist());
+	cl::opt<bool> outputIsModule("module-out", cl::desc("Output LLVM module"), whitelist());
+	
+	cl::alias additionalEntryPointsAlias("e", cl::desc("Alias for --other-entry"), cl::aliasopt(additionalEntryPoints), whitelist());
+	cl::alias partialDisassemblyAlias("p", cl::desc("Alias for --partial"), cl::aliasopt(partialDisassembly), whitelist());
+	cl::alias additionalPassesAlias("O", cl::desc("Alias for --opt"), cl::aliasopt(additionalPasses), whitelist());
+	cl::alias inputIsModuleAlias("m", cl::desc("Alias for --module-in"), cl::aliasopt(inputIsModule), whitelist());
+	cl::alias outputIsModuleAlias("n", cl::desc("Alias for --module-out"), cl::aliasopt(outputIsModule), whitelist());
+	
+	inline int partialOptCount()
 	{
-		return N;
+		static int count = 0;
+		static bool counted = false;
+		if (!counted)
+		{
+			for (bool opt : partialDisassembly)
+			{
+				count += opt ? 1 : -1;
+			}
+			counted = true;
+		}
+		return count;
+	}
+	
+	void pruneOptionList(StringMap<cl::Option*>& list)
+	{
+		for (auto& pair : list)
+		{
+			if (!whitelist::isWhitelisted(*pair.second))
+			{
+				pair.second->setHiddenFlag(cl::ReallyHidden);
+			}
+		}
+	}
+	
+	template<typename T>
+	string errorOf(const ErrorOr<T>& error)
+	{
+		return error.getError().message();
 	}
 	
 	template<typename TAction>
@@ -87,408 +133,445 @@ namespace
 		return count;
 	}
 	
-	legacy::PassManager createBasePassManager()
+	bool refillEntryPoints(const TranslationContext& transl, const Executable& executable, unordered_map<uint64_t, SymbolInfo>& toVisit, size_t iterations)
 	{
-		legacy::PassManager pm;
-		pm.add(createTypeBasedAliasAnalysisPass());
-		pm.add(createScopedNoAliasAAPass());
-		pm.add(createBasicAliasAnalysisPass());
-		pm.add(createAddressSpaceAliasAnalysisPass());
-		return pm;
-	}
-	
-	TargetInfo* createX86TargetInfo()
-	{
-		TargetInfo* targetInfo = createTargetInfoPass();
-		x86TargetInfo(targetInfo);
-		return targetInfo;
-	}
-	
-	unique_ptr<Module> makeModule(LLVMContext& context, Executable& object, const string& objectName)
-	{
-		x86_config config64 = { 8, X86_REG_RIP, X86_REG_RSP, X86_REG_RBP };
-		translation_context transl(context, config64, objectName);
-		unordered_map<uint64_t, SymbolInfo> toVisit;
-		
-		for (uint64_t address : object.getVisibleEntryPoints())
+		if (isExclusiveDisassembly() || (isPartialDisassembly() && iterations > 1))
 		{
-			auto symbolInfo = object.getInfo(address);
-			assert(symbolInfo != nullptr);
-			if (symbolInfo->name != "")
-			{
-				transl.create_alias(symbolInfo->virtualAddress, symbolInfo->name);
-			}
-			toVisit.insert({symbolInfo->virtualAddress, move(*symbolInfo)});
+			return false;
 		}
 		
-		unordered_map<uint64_t, result_function> functions;
-		
-		while (toVisit.size() > 0)
+		for (uint64_t entryPoint : transl.getDiscoveredEntryPoints())
 		{
-			auto iter = toVisit.begin();
-			auto functionInfo = iter->second;
-			toVisit.erase(iter);
-			
-			result_function fn_temp = transl.create_function(functionInfo.name, functionInfo.virtualAddress, functionInfo.memory, object.end());
-			auto inserted_function = functions.insert(make_pair(functionInfo.virtualAddress, move(fn_temp))).first;
-			result_function& fn = inserted_function->second;
-			
-			for (auto callee = fn.callees_begin(); callee != fn.callees_end(); callee++)
+			if (auto symbolInfo = executable.getInfo(entryPoint))
 			{
-				auto destination = *callee;
-				if (functions.find(destination) == functions.end())
+				toVisit.insert({entryPoint, *symbolInfo});
+			}
+		}
+		return !toVisit.empty();
+	}
+	
+	class Main
+	{
+		int argc;
+		char** argv;
+	
+		LLVMContext& llvm;
+		PythonContext python;
+		vector<Pass*> additionalPasses;
+	
+		static legacy::PassManager createBasePassManager()
+		{
+			legacy::PassManager pm;
+			pm.add(createTypeBasedAliasAnalysisPass());
+			pm.add(createScopedNoAliasAAPass());
+			pm.add(createBasicAliasAnalysisPass());
+			pm.add(createProgramMemoryAliasAnalysis());
+			return pm;
+		}
+	
+	public:
+		Main(int argc, char** argv)
+		: argc(argc), argv(argv), llvm(getGlobalContext()), python(argv[0])
+		{
+		}
+	
+		string getProgramName() { return sys::path::stem(argv[0]); }
+		LLVMContext& getContext() { return llvm; }
+	
+		ErrorOr<unique_ptr<Executable>> parseExecutable(MemoryBuffer& executableCode)
+		{
+			auto start = reinterpret_cast<const uint8_t*>(executableCode.getBufferStart());
+			auto end = reinterpret_cast<const uint8_t*>(executableCode.getBufferEnd());
+			return Executable::parse(start, end);
+		}
+		
+		ErrorOr<unique_ptr<Module>> generateAnnotatedModule(Executable& executable, const string& moduleName = "fcd-out")
+		{
+			x86_config config64 = { x86_isa64, 8, X86_REG_RIP, X86_REG_RSP, X86_REG_RBP };
+			TranslationContext transl(llvm, config64, moduleName);
+	
+			unordered_map<uint64_t, SymbolInfo> toVisit;
+			for (uint64_t address : executable.getVisibleEntryPoints())
+			{
+				auto symbolInfo = executable.getInfo(address);
+				// Entry points are always considered when naming symbols, but only used in full disassembly mode.
+				// Otherwise, we expect symbols to be specified with the command line.
+				if (isFullDisassembly())
 				{
-					if (auto symbolInfo = object.getInfo(destination))
-					{
-						toVisit.insert({destination, *symbolInfo});
-					}
+					assert(symbolInfo != nullptr);
+					toVisit.insert({symbolInfo->virtualAddress, *symbolInfo});
 				}
 			}
-		}
-		
-		for (auto& pair : functions)
-		{
-			pair.second.take();
-		}
-		
-		// Perform early optimizations to make the module suitable for analysis
-		auto module = transl.take();
-		legacy::PassManager phaseOne = createBasePassManager();
-		phaseOne.add(createInstructionCombiningPass());
-		phaseOne.add(createCFGSimplificationPass());
-		phaseOne.add(createRegisterPointerPromotionPass());
-		phaseOne.add(createNewGVNPass());
-		phaseOne.add(createDeadStoreEliminationPass());
-		phaseOne.add(createInstructionCombiningPass());
-		phaseOne.add(createCFGSimplificationPass());
-		phaseOne.add(createGlobalDCEPass());
-		phaseOne.run(*module);
-		return module;
-	}
 	
-	// TODO: Think of another way to architecture this. We'll need it to create different front-ends.
-	void hackhack_systemVabi(const TargetInfo& x86Info, unordered_map<const char*, RegisterUse::ModRefResult>& table, size_t argCount, bool returns = true, bool variadic = false)
-	{
-		static const char* const argumentRegs[] = {
-			"rdi", "rsi", "rdx", "rcx", "r8", "r9"
-		};
-		
-		table[x86Info.keyName("rax")] = returns ? RegisterUse::Mod : RegisterUse::NoModRef;
-		table[x86Info.keyName("rbx")] = RegisterUse::NoModRef;
-		
-		table[x86Info.keyName("r10")] = RegisterUse::NoModRef;
-		table[x86Info.keyName("r11")] = RegisterUse::NoModRef;
-		table[x86Info.keyName("r12")] = RegisterUse::NoModRef;
-		table[x86Info.keyName("r13")] = RegisterUse::NoModRef;
-		table[x86Info.keyName("r14")] = RegisterUse::NoModRef;
-		table[x86Info.keyName("r15")] = RegisterUse::NoModRef;
-		
-		table[x86Info.keyName("rbp")] = RegisterUse::NoModRef;
-		table[x86Info.keyName("rsp")] = variadic ? RegisterUse::Ref : RegisterUse::NoModRef;
-		table[x86Info.keyName("rip")] = RegisterUse::NoModRef;
-		
-		for (size_t i = 0; i < countof(argumentRegs); i++)
-		{
-			const char* uniqued = x86Info.keyName(argumentRegs[i]);
-			table[uniqued] = i < argCount ? RegisterUse::Ref : RegisterUse::NoModRef;
-		}
-	}
-	
-	struct ParameterInfo
-	{
-		size_t count;
-		bool returns;
-		bool variadic;
-	};
-	
-	void fixupStub(RegisterUse& regUse, Function& functionToFix, const string& importName)
-	{
-		// we probably need a better way of acquiring this data
-		static unordered_map<string, ParameterInfo> knownFunctions
-		{
-			{"__assert_fail",		{4, false, false}},
-			{"__libc_start_main",	{7, true, false}},
-			{"__gmon_start__",		{0, false, false}},
-			{"_IO_getc",			{1, true, false}},
-			{"_IO_putc",			{2, true, false}},
-			{"atoi",				{1, true, false}},
-			{"exit",				{1, false, false}},
-			{"calloc",				{2, true, false}},
-			{"difftime",			{2, true, false}},
-			{"fclose",				{1, true, false}},
-			{"fgets",				{3, true, false}},
-			{"fflush",				{1, true, false}},
-			{"fopen",				{2, true, false}},
-			{"fork",				{0, true, false}},
-			{"free",				{1, false, false}},
-			{"fscanf",				{2, true, true}},
-			{"fseek",				{3, true, false}},
-			{"ftell",				{1, true, false}},
-			{"fwrite",				{4, true, false}},
-			{"getchar",				{0, true, false}},
-			{"getenv",				{1, true, false}},
-			{"gets",				{1, true, false}},
-			{"isalpha",				{1, true, false}},
-			{"localtime",			{1, true, false}},
-			{"malloc",				{1, true, false}},
-			{"memset",				{3, true, false}},
-			{"putchar",				{1, true, false}},
-			{"puts",				{1, true, false}},
-			{"printf",              {1, true, true}},
-			{"rand",				{0, true, false}},
-			{"random",				{0, true, false}},
-			{"scanf",				{1, true, true}},
-			{"setbuf",				{2, false, false}},
-			{"sprintf",				{2, true, true}},
-			{"srand",				{1, false, false}},
-			{"sscanf",				{2, true, true}},
-			{"strcasecmp",			{2, true, false}},
-			{"strchr",				{2, true, false}},
-			{"strcpy",				{2, true, false}},
-			{"strlen",				{1, true, false}},
-			{"strtol",				{3, true, false}},
-			{"system",				{1, true, false}},
-			{"time",				{1, true, false}},
-			{"toupper",				{1, true, false}},
-			{"wait",				{1, true, false}},
-		};
-		
-		auto iter = knownFunctions.find(importName);
-		if (iter != knownFunctions.end())
-		{
-			auto& paramInfo = iter->second;
-			unique_ptr<TargetInfo> targetInfo(createX86TargetInfo());
-			functionToFix.deleteBody();
-			functionToFix.setName(importName);
-			hackhack_systemVabi(*targetInfo, regUse.getOrCreateModRefInfo(&functionToFix), paramInfo.count, paramInfo.returns, paramInfo.variadic);
-		}
-		else
-		{
-			assert(!"Unknown function");
-		}
-	}
-	
-	unique_ptr<RegisterUse> fixupStubs(Module& module, Executable& object)
-	{
-		Function* jumpIntrin = module.getFunction("x86_jump_intrin");
-		// This may eventually need to be moved to a pass of its own or something.
-		auto regUse = std::make_unique<RegisterUse>();
-		vector<Function*> functions;
-		for (Function& fn : module.getFunctionList())
-		{
-			if (fn.isDeclaration())
+			unordered_set<uint64_t> entryPoints(additionalEntryPoints.begin(), additionalEntryPoints.end());
+			for (uint64_t address : entryPoints)
 			{
-				continue;
-			}
-			
-			BasicBlock& entry = fn.getEntryBlock();
-			auto terminator = entry.getTerminator();
-			if (isa<ReturnInst>(terminator))
-			{
-				if (auto prev = dyn_cast<CallInst>(terminator->getPrevNode()))
-				if (prev->getCalledFunction() == jumpIntrin)
-				if (auto load = dyn_cast<LoadInst>(prev->getOperand(2)))
-				if (auto constantExpr = dyn_cast<ConstantExpr>(load->getPointerOperand()))
+				if (auto symbolInfo = executable.getInfo(address))
 				{
-					unique_ptr<Instruction> inst(constantExpr->getAsInstruction());
-					if (auto int2ptr = dyn_cast<IntToPtrInst>(inst.get()))
+					toVisit.insert({symbolInfo->virtualAddress, *symbolInfo});
+				}
+				else
+				{
+					return make_error_code(FcdError::Main_EntryPointOutOfMappedMemory);
+				}
+			}
+	
+			if (toVisit.size() == 0)
+			{
+				return make_error_code(FcdError::Main_NoEntryPoint);
+			}
+	
+			size_t iterations = 0;
+			do
+			{
+				while (toVisit.size() > 0)
+				{
+					auto iter = toVisit.begin();
+					auto functionInfo = iter->second;
+					toVisit.erase(iter);
+			
+					if (functionInfo.name.size() > 0)
 					{
-						auto value = cast<ConstantInt>(int2ptr->getOperand(0));
-						auto intValue = value->getLimitedValue();
-						if (const string* stubTarget = object.getStubTarget(intValue))
+						transl.setFunctionName(functionInfo.virtualAddress, functionInfo.name);
+					}
+					
+					Function* fn = transl.createFunction(executable, functionInfo.virtualAddress);
+					// Couldn't decompile, abort
+					if (fn == nullptr)
+					{
+						return make_error_code(FcdError::Main_DecompilationError);
+					}
+				}
+				iterations++;
+			}
+			while (refillEntryPoints(transl, executable, toVisit, iterations));
+	
+			// Perform early optimizations to make the module suitable for analysis
+			auto module = transl.take();
+			legacy::PassManager phaseOne = createBasePassManager();
+			phaseOne.add(createInstructionCombiningPass());
+			phaseOne.add(createCFGSimplificationPass());
+			phaseOne.add(createRegisterPointerPromotionPass());
+			phaseOne.add(createGVNPass());
+			phaseOne.add(createDeadStoreEliminationPass());
+			phaseOne.add(createInstructionCombiningPass());
+			phaseOne.add(createCFGSimplificationPass());
+			phaseOne.add(createGlobalDCEPass());
+			phaseOne.run(*module);
+	
+			// Annotate stubs before returning module
+			annotateStubs(executable, *module);
+			return move(module);
+		}
+
+		void annotateStubs(Executable& executable, Module& module)
+		{
+			Function* jumpIntrin = module.getFunction("x86_jump_intrin");
+
+			// This may eventually need to be moved to a pass of its own or something.
+			vector<Function*> functions;
+			for (Function& fn : module.getFunctionList())
+			{
+				if (md::isPrototype(fn))
+				{
+					continue;
+				}
+	
+				BasicBlock& entry = fn.getEntryBlock();
+				auto terminator = entry.getTerminator();
+				if (isa<UnreachableInst>(terminator))
+				{
+					if (auto prev = dyn_cast<CallInst>(terminator->getPrevNode()))
+					if (prev->getCalledFunction() == jumpIntrin)
+					if (auto load = dyn_cast<LoadInst>(prev->getOperand(2)))
+					if (auto constantExpr = dyn_cast<ConstantExpr>(load->getPointerOperand()))
+					{
+						unique_ptr<Instruction> inst(constantExpr->getAsInstruction());
+						if (auto int2ptr = dyn_cast<IntToPtrInst>(inst.get()))
 						{
-							fixupStub(*regUse, fn, *stubTarget);
+							auto value = cast<ConstantInt>(int2ptr->getOperand(0));
+							auto intValue = value->getLimitedValue();
+							if (const string* stubTarget = executable.getStubTarget(intValue))
+							{
+								md::setImportName(fn, *stubTarget);
+								fn.setName(*stubTarget);
+							}
 						}
 					}
 				}
 			}
 		}
-		return regUse;
-	}
+
+		bool optimizeAndTransformModule(Module& module, raw_ostream& errorOutput, Executable* executable = nullptr)
+		{
+			// Do we still have instances of the unimplemented intrinsic? Bail out here if so.
+			size_t errorCount = 0;
+			if (Function* unimplemented = module.getFunction("x86_unimplemented"))
+			{
+				errorCount += forEachCall(unimplemented, 1, [](const string& message) {
+					cerr << "translation for instruction '" << message << "' is missing" << endl;
+				});
+			}
 	
-	int decompile(Module& module, const RegisterUse& regUseBase, raw_os_ostream& output)
-	{
-		// Do we still have instances of the unimplemented intrinsic? Bail out here if so.
-		size_t errorCount = 0;
-		if (Function* unimplemented = module.getFunction("x86_unimplemented"))
-		{
-			errorCount += forEachCall(unimplemented, 1, [](const string& message) {
-				cerr << "translation for instruction '" << message << "' is missing" << endl;
-			});
-		}
+			if (Function* assertionFailure = module.getFunction("x86_assertion_failure"))
+			{
+				errorCount += forEachCall(assertionFailure, 0, [](const string& message) {
+					cerr << "translation assertion failure: " << message << endl;
+				});
+			}
+	
+			if (errorCount > 0)
+			{
+				cerr << "incorrect or missing translations; cannot decompile" << endl;
+				return false;
+			}
+	
+			// Phase two: discover things, simplify other things
+			for (int i = 0; i < 2; i++)
+			{
+				auto phaseTwo = createBasePassManager();
+				phaseTwo.add(new ExecutableWrapper(executable));
+				phaseTwo.add(createParameterRegistryPass());
+				phaseTwo.add(createConditionSimplificationPass());
+				phaseTwo.add(createGVNPass());
+				phaseTwo.add(createDeadStoreEliminationPass());
+				phaseTwo.add(createInstructionCombiningPass());
+				phaseTwo.add(createCFGSimplificationPass());
+				phaseTwo.run(module);
 		
-		if (Function* assertionFailure = module.getFunction("x86_assertion_failure"))
-		{
-			errorCount += forEachCall(assertionFailure, 0, [](const string& message) {
-				cerr << "translation assertion failure: " << message << endl;
-			});
-		}
-		
-		if (errorCount > 0)
-		{
-			cerr << "incorrect or missing translations; cannot decompile" << endl;
-			return 1;
-		}
-		
-		// Phase two: discover things, simplify other things
-		for (int i = 0; i < 2; i++)
-		{
-			auto phaseTwo = createBasePassManager();
-			phaseTwo.add(createX86TargetInfo());
-			phaseTwo.add(new RegisterUse(regUseBase));
-			phaseTwo.add(createGVNPass());
-			phaseTwo.add(createDeadStoreEliminationPass());
-			phaseTwo.add(createInstructionCombiningPass());
-			phaseTwo.add(createCFGSimplificationPass());
-			phaseTwo.run(module);
-			
 #if DEBUG
-			if (verifyModule(module, &output))
+				if (verifyModule(module, &errorOutput))
+				{
+					// errors!
+					return false;
+				}
+#endif
+			}
+	
+			// Phase 3: make into functions with arguments, run codegen.
+			auto phaseThree = createBasePassManager();
+			phaseThree.add(new ExecutableWrapper(executable));
+			phaseThree.add(createParameterRegistryPass());
+			phaseThree.add(createGlobalDCEPass());
+			phaseThree.add(createFixIndirectsPass());
+			phaseThree.add(createArgumentRecoveryPass());
+			phaseThree.add(createModuleThinnerPass());
+			phaseThree.add(createSignExtPass());
+			phaseThree.add(createConditionSimplificationPass());
+	
+			// XXX: do something about this, I keep coming back to add passes to
+			// accommodate my custom passes
+			
+			// add any additional pass here
+			for (Pass* pass : additionalPasses)
+			{
+				phaseThree.add(pass);
+			}
+			additionalPasses.clear();
+	
+			phaseThree.add(createInstructionCombiningPass());
+			phaseThree.add(createSROAPass());
+			phaseThree.add(createInstructionCombiningPass());
+			phaseThree.add(createGVNPass());
+			phaseThree.add(createCFGSimplificationPass());
+			phaseThree.add(createInstructionCombiningPass());
+			phaseThree.add(createGVNPass());
+			phaseThree.add(createIdentifyLocalsPass());
+			phaseThree.add(createDeadStoreEliminationPass());
+			phaseThree.add(createIPSCCPPass());
+			phaseThree.add(createCFGSimplificationPass());
+			phaseThree.add(createNoopCastEliminationPass());
+			phaseThree.add(createInstructionCombiningPass());
+			phaseThree.add(createMemorySSADeadLoadEliminationPass());
+			phaseThree.add(createDeadStoreEliminationPass());
+			phaseThree.add(createInstructionCombiningPass());
+			phaseThree.add(createSROAPass());
+			phaseThree.add(createInstructionCombiningPass());
+			phaseThree.add(createGlobalDCEPass());
+			phaseThree.add(createCFGSimplificationPass());
+			phaseThree.run(module);
+	
+#ifdef DEBUG
+			if (verifyModule(module, &errorOutput))
 			{
 				// errors!
-				return 1;
+				return false;
 			}
 #endif
+			return true;
 		}
-		
-		// Phase 3: make into functions with arguments, run codegen
-		auto phaseThree = createBasePassManager();
-		phaseThree.add(createX86TargetInfo());
-		phaseThree.add(new RegisterUse(regUseBase));
-		phaseThree.add(createArgumentRecoveryPass());
-		phaseThree.add(createInstructionCombiningPass());
-		phaseThree.add(createSROAPass());
-		phaseThree.add(createGVNPass());
-		phaseThree.add(createDeadStoreEliminationPass());
-		phaseThree.add(createIPSCCPPass());
-		phaseThree.add(createCFGSimplificationPass());
-		phaseThree.add(createGlobalDCEPass());
-		phaseThree.run(module);
-		
-#ifdef DEBUG
-		if (verifyModule(module, &output))
+
+		bool generateEquivalentPseudocode(Module& module, raw_ostream& output)
 		{
-			// errors!
+			// Run that module through the output pass
+			// UnwrapReturns happens after value propagation because value propagation doesn't know that calls
+			// are generally not safe to reorder.
+			AstBackEnd* backend = createAstBackEnd();
+			backend->addPass(new AstBranchCombine);
+			backend->addPass(new AstFlatten);
+			backend->addPass(new AstPropagateValues);
+			backend->addPass(new AstSimplifyExpressions);
+			backend->addPass(new AstRemoveUndef);
+			backend->addPass(new AstBranchCombine);
+			backend->addPass(new AstPrint(output));
+	
+			legacy::PassManager outputPhase;
+			outputPhase.add(createSESELoopPass());
+			outputPhase.add(createEarlyCSEPass()); // EarlyCSE eliminates redundant PHI nodes
+			outputPhase.add(backend);
+			outputPhase.run(module);
+			return true;
+		}
+	
+		static void initializePasses()
+		{
+			auto& pr = *PassRegistry::getPassRegistry();
+			initializeCore(pr);
+			initializeVectorization(pr);
+			initializeIPO(pr);
+			initializeAnalysis(pr);
+			initializeIPA(pr);
+			initializeTransformUtils(pr);
+			initializeInstCombine(pr);
+			initializeScalarOpts(pr);
+		
+			// TODO: remove when MemorySSA goes mainstream
+			initializeMemorySSAPrinterPassPass(pr);
+			initializeMemorySSALazyPass(pr);
+		
+			initializeParameterRegistryPass(pr);
+			initializeArgumentRecoveryPass(pr);
+			initializeAstBackEndPass(pr);
+			initializeSESELoopPass(pr);
+		}
+	
+		bool prepareOptimizationPasses()
+		{
+			PassRegistry* pr = PassRegistry::getPassRegistry();
+			for (const string& pass : ::additionalPasses)
+			{
+				auto ext = sys::path::extension(pass);
+				if (ext == ".py" || ext == ".pyc" || ext == ".pyo")
+				{
+					if (auto passOrError = python.createPass(pass))
+					{
+						additionalPasses.push_back(passOrError.get());
+					}
+					else
+					{
+						cerr << getProgramName() << ": couldn't load " << pass << ": " << errorOf(passOrError) << endl;
+						return false;
+					}
+				}
+				else if (const PassInfo* pi = pr->getPassInfo(pass))
+				{
+					additionalPasses.push_back(pi->createPass());
+				}
+				else
+				{
+					cerr << getProgramName() << ": couldn't identify pass " << pass << endl;
+					return false;
+				}
+			}
+			return true;
+		}
+	};
+}
+
+bool isFullDisassembly()
+{
+	return partialOptCount() < 1;
+}
+
+bool isPartialDisassembly()
+{
+	return partialOptCount() == 1;
+}
+
+bool isExclusiveDisassembly()
+{
+	return partialOptCount() > 1;
+}
+
+bool isEntryPoint(uint64_t vaddr)
+{
+	return any_of(additionalEntryPoints.begin(), additionalEntryPoints.end(), [&](uint64_t entryPoint)
+	{
+		return vaddr == entryPoint;
+	});
+}
+
+int main(int argc, char** argv)
+{
+	pruneOptionList(cl::getRegisteredOptions());
+	cl::ParseCommandLineOptions(argc, argv, "native program decompiler");
+	Main::initializePasses();
+	
+	Main mainObj(argc, argv);
+	string program = mainObj.getProgramName();
+	
+	// step 0: before even attempting anything, prepare optimization passes
+	// (the user won't be happy if we work for 5 minutes only to discover that the optimization passes don't load)
+	if (!mainObj.prepareOptimizationPasses())
+	{
+		return 1;
+	}
+	
+	unique_ptr<Executable> executable;
+	unique_ptr<Module> module;
+	
+	// step one: create annotated module from executable (or load it from .ll)
+	if (inputIsModule)
+	{
+		SMDiagnostic errors;
+		module = parseIRFile(inputFile, errors, mainObj.getContext());
+		if (!module)
+		{
+			errors.print(argv[0], errs());
 			return 1;
 		}
-#endif
-		
-		// Run that module through the output pass
-		auto useAnalysis = new AstVariableReferences;
-		AstBackEnd* backend = createAstBackEnd();
-		backend->addPass(new AstFlatten);
-		backend->addPass(new AstBranchCombine);
-		backend->addPass(useAnalysis);
-		backend->addPass(new AstPropagateValues(*useAnalysis));
-		backend->addPass(new AstRemoveUndef(*useAnalysis));
-		backend->addPass(new AstFlatten);
-		backend->addPass(new AstBranchCombine);
-		backend->addPass(new AstSimplifyExpressions);
-		
-		legacy::PassManager outputPhase;
-		outputPhase.add(createX86TargetInfo());
-		outputPhase.add(createSESELoopPass());
-		outputPhase.add(createEarlyCSEPass()); // EarlyCSE eliminates redundant PHI nodes
-		outputPhase.add(backend);
-		outputPhase.run(module);
-		
-		for (auto& pair : move(*backend).getResult())
+	}
+	else
+	{
+		auto bufferOrError = MemoryBuffer::getFile(inputFile, -1, false);
+		if (!bufferOrError)
 		{
-			output << pair.second << '\n';
+			cerr << program << ": can't open " << inputFile << ": " << errorOf(bufferOrError) << endl;
+			return 1;
 		}
 		
+		auto executableOrError = mainObj.parseExecutable(*bufferOrError.get());
+		if (!executableOrError)
+		{
+			cerr << program << ": couldn't parse " << inputFile << ": " << errorOf(executableOrError) << endl;
+			return 1;
+		}
+		
+		executable = move(executableOrError.get());
+		string moduleName = sys::path::stem(inputFile);
+		auto moduleOrError = mainObj.generateAnnotatedModule(*executable, moduleName);
+		if (!moduleOrError)
+		{
+			cerr << program << ": couldn't build LLVM module out of " << inputFile << ": " << errorOf(moduleOrError) << endl;
+			return 1;
+		}
+		
+		module = move(moduleOrError.get());
+	}
+	
+	// if we want module output, this is where we stop
+	if (outputIsModule)
+	{
+		module->print(outs(), nullptr);
 		return 0;
 	}
 	
-	void initializePasses()
+	// step two: optimize module
+	if (!mainObj.optimizeAndTransformModule(*module, errs(), executable.get()))
 	{
-		auto& pr = *PassRegistry::getPassRegistry();
-		initializeCore(pr);
-		initializeScalarOpts(pr);
-		initializeVectorization(pr);
-		initializeIPO(pr);
-		initializeAnalysis(pr);
-		initializeIPA(pr);
-		initializeTransformUtils(pr);
-		initializeInstCombine(pr);
-		
-		initializeTargetInfoPass(pr);
-		initializeRegisterUsePass(pr);
-		initializeArgumentRecoveryPass(pr);
-		initializeAstBackEndPass(pr);
-		initializeSESELoopPass(pr);
-	}
-
-	const char* basename(const char* path)
-	{
-		const char* result = path;
-		for (auto iter = result; *iter; iter++)
-		{
-			if (*iter == '/')
-			{
-				result = iter + 1;
-			}
-		}
-		return result;
-	}
-}
-
-int main(int argc, const char** argv)
-{
-	// We may want to use more elegant option parsing code eventually.
-	const char* programName = basename(argv[0]);
-	const char* filePath = nullptr;
-	
-	for (auto iter = &argv[1]; iter != &argv[argc]; iter++)
-	{
-		if ((*iter)[0] == '-')
-		{
-			continue;
-		}
-		
-		if (filePath == nullptr)
-		{
-			filePath = *iter;
-		}
-		else
-		{
-			cerr << "usage: " << programName << " path" << endl;
-			return 1;
-		}
-	}
-	
-	if (filePath == nullptr)
-	{
-		cerr << "usage: " << programName << " path" << endl;
 		return 1;
 	}
 	
-	const char* fileName = basename(filePath);
-	pair<const uint8_t*, const uint8_t*> mapping;
-	try
-	{
-		mapping = Executable::mmap(filePath);
-	}
-	catch (exception& ex)
-	{
-		cerr << programName << ": can't map " << filePath << ": " << ex.what() << endl;
-		return 1;
-	}
-	
-	initializePasses();
-	
-	if (auto executable = Executable::parse(mapping.first, mapping.second))
-	{
-		LLVMContext context;
-		if (auto module = makeModule(context, *executable, fileName))
-		{
-			raw_os_ostream rout(cout);
-			auto regUse = fixupStubs(*module, *executable);
-			decompile(*module, *regUse, rout);
-			return 0;
-		}
-	}
-	
-	cerr << programName << ": couldn't parse executable " << filePath << endl;
-	return 2;
+	// step three (final step): emit pseudocode
+	return mainObj.generateEquivalentPseudocode(*module, outs()) ? 0 : 1;
 }

@@ -32,12 +32,12 @@ namespace
 			return false;
 		}
 		
-		if (statement == KeywordNode::breakNode)
+		if (statement == KeywordStatement::breakNode)
 		{
 			return true;
 		}
 		
-		if (auto seq = dyn_cast<SequenceNode>(statement))
+		if (auto seq = dyn_cast<SequenceStatement>(statement))
 		{
 			for (auto stmt : seq->statements)
 			{
@@ -45,7 +45,7 @@ namespace
 					return true;
 			}
 		}
-		else if (auto ifElse = dyn_cast<IfElseNode>(statement))
+		else if (auto ifElse = dyn_cast<IfElseStatement>(statement))
 		{
 			return containsBreakStatement(ifElse->ifBody) || containsBreakStatement(ifElse->elseBody);
 		}
@@ -54,11 +54,41 @@ namespace
 		// loop.
 		return false;
 	}
+	
+	// XXX: uncool given that deques typically can insert in front of something
+	template<typename T>
+	void push_front(PooledDeque<T>& deque, T item)
+	{
+		size_t size = deque.size();
+		deque.push_back(item);
+		for (size_t i = 0; i < size; ++i)
+		{
+			deque[i + 1] = deque[i];
+		}
+		deque[0] = item;
+	}
+	
+	template<typename T>
+	struct DelayedSet
+	{
+		T& target;
+		T value;
+		
+		DelayedSet(T& target)
+		: target(target)
+		{
+		}
+		
+		~DelayedSet()
+		{
+			target = value;
+		}
+	};
 }
 
-void AstFlatten::removeBranch(SequenceNode &parent, size_t ifIndex, bool branch)
+void AstFlatten::removeBranch(SequenceStatement &parent, size_t ifIndex, bool branch)
 {
-	IfElseNode* ifElse = cast<IfElseNode>(parent.statements[ifIndex]);
+	IfElseStatement* ifElse = cast<IfElseStatement>(parent.statements[ifIndex]);
 	if (branch)
 	{
 		// remove if body
@@ -80,30 +110,30 @@ void AstFlatten::removeBranch(SequenceNode &parent, size_t ifIndex, bool branch)
 	}
 }
 
-void AstFlatten::structurizeLoop(LoopNode *loop)
+void AstFlatten::structurizeLoop(LoopStatement *loop)
 {
 	while (loop->isEndless())
 	{
-		if (auto sequence = dyn_cast<SequenceNode>(loop->loopBody))
+		if (auto sequence = dyn_cast<SequenceStatement>(loop->loopBody))
 		{
 			size_t lastIndex = sequence->statements.size();
 			assert(lastIndex > 0);
 			lastIndex--;
 			
-			if (auto ifElse = dyn_cast<IfElseNode>(sequence->statements[lastIndex]))
+			if (auto ifElse = dyn_cast<IfElseStatement>(sequence->statements[lastIndex]))
 			{
 				// DoWhile
-				if (ifElse->ifBody == KeywordNode::breakNode)
+				if (ifElse->ifBody == KeywordStatement::breakNode)
 				{
 					loop->condition = negate(ifElse->condition);
-					loop->position = LoopNode::PostTested;
+					loop->position = LoopStatement::PostTested;
 					removeBranch(*sequence, lastIndex, true);
 					continue;
 				}
-				else if (ifElse->elseBody == KeywordNode::breakNode)
+				else if (ifElse->elseBody == KeywordStatement::breakNode)
 				{
 					loop->condition = ifElse->condition;
-					loop->position = LoopNode::PostTested;
+					loop->position = LoopStatement::PostTested;
 					removeBranch(*sequence, lastIndex, false);
 					continue;
 				}
@@ -119,11 +149,11 @@ void AstFlatten::structurizeLoop(LoopNode *loop)
 					if (!hasBreak)
 					{
 						sequence->statements.erase_at(lastIndex);
-						LoopNode* innerLoop = pool().allocate<LoopNode>(sequence);
+						LoopStatement* innerLoop = pool().allocate<LoopStatement>(sequence);
 						innerLoop->condition = negate(ifElse->condition);
 						Statement* simplified = flatten(innerLoop);
 						
-						auto outerLoopBody = pool().allocate<SequenceNode>(pool());
+						auto outerLoopBody = pool().allocate<SequenceStatement>(pool());
 						outerLoopBody->statements.push_back(simplified);
 						outerLoopBody->statements.push_back(ifElse->ifBody);
 						loop->loopBody = outerLoopBody;
@@ -133,19 +163,19 @@ void AstFlatten::structurizeLoop(LoopNode *loop)
 			}
 			
 			// While
-			if (auto ifElse = dyn_cast<IfElseNode>(sequence->statements[0]))
+			if (auto ifElse = dyn_cast<IfElseStatement>(sequence->statements[0]))
 			{
-				if (ifElse->ifBody == KeywordNode::breakNode)
+				if (ifElse->ifBody == KeywordStatement::breakNode)
 				{
 					loop->condition = negate(ifElse->condition);
-					loop->position = LoopNode::PreTested;
+					loop->position = LoopStatement::PreTested;
 					removeBranch(*sequence, 0, true);
 					continue;
 				}
-				else if (ifElse->elseBody == KeywordNode::breakNode)
+				else if (ifElse->elseBody == KeywordStatement::breakNode)
 				{
 					loop->condition = ifElse->condition;
-					loop->position = LoopNode::PreTested;
+					loop->position = LoopStatement::PreTested;
 					removeBranch(*sequence, 0, false);
 					continue;
 				}
@@ -153,7 +183,7 @@ void AstFlatten::structurizeLoop(LoopNode *loop)
 			
 			// Pretty sure that LoopToSeq can't happen with our pipeline.
 		}
-		else if (auto ifElse = dyn_cast<IfElseNode>(loop->loopBody))
+		else if (auto ifElse = dyn_cast<IfElseStatement>(loop->loopBody))
 		{
 			// CondToSeq, CondToSeqNeg
 			if (ifElse->ifBody != nullptr && ifElse->elseBody != nullptr)
@@ -162,18 +192,18 @@ void AstFlatten::structurizeLoop(LoopNode *loop)
 				bool falseHasBreak = containsBreakStatement(ifElse->elseBody);
 				if (trueHasBreak != falseHasBreak)
 				{
-					LoopNode* innerLoop;
+					LoopStatement* innerLoop;
 					Statement* next;
-					auto outerBody = pool().allocate<SequenceNode>(pool());
+					auto outerBody = pool().allocate<SequenceStatement>(pool());
 					if (falseHasBreak)
 					{
-						innerLoop = pool().allocate<LoopNode>(ifElse->ifBody);
+						innerLoop = pool().allocate<LoopStatement>(ifElse->ifBody);
 						innerLoop->condition = ifElse->condition;
 						next = ifElse->elseBody;
 					}
 					else
 					{
-						innerLoop = pool().allocate<LoopNode>(ifElse->elseBody);
+						innerLoop = pool().allocate<LoopStatement>(ifElse->elseBody);
 						innerLoop->condition = negate(ifElse->condition);
 						next = ifElse->ifBody;
 					}
@@ -189,14 +219,14 @@ void AstFlatten::structurizeLoop(LoopNode *loop)
 	}
 }
 
-void AstFlatten::visitSequence(SequenceNode* sequence)
+void AstFlatten::visitSequence(SequenceStatement* sequence)
 {
-	auto result = pool().allocate<SequenceNode>(pool());
+	auto result = pool().allocate<SequenceStatement>(pool());
 	for (Statement* statement : sequence->statements)
 	{
 		if (Statement* flattened = flatten(statement))
 		{
-			if (auto subSeq = dyn_cast<SequenceNode>(flattened))
+			if (auto subSeq = dyn_cast<SequenceStatement>(flattened))
 			{
 				result->statements.push_back(subSeq->statements.begin(), subSeq->statements.end());
 			}
@@ -222,7 +252,7 @@ void AstFlatten::visitSequence(SequenceNode* sequence)
 	}
 }
 
-void AstFlatten::visitIfElse(IfElseNode* ifElse)
+void AstFlatten::visitIfElse(IfElseStatement* ifElse)
 {
 	Statement* flatIfBody = flatten(ifElse->ifBody);
 	Statement* flatElseBody = flatten(ifElse->elseBody);
@@ -241,42 +271,75 @@ void AstFlatten::visitIfElse(IfElseNode* ifElse)
 	{
 		ifElse->ifBody = flatIfBody;
 		ifElse->elseBody = flatElseBody;
+		
+		if (auto innerIf = dyn_cast<IfElseStatement>(flatIfBody))
+		if (innerIf->elseBody == nullptr && ifElse->elseBody == nullptr)
+		{
+			// combine the two with an &&
+			NAryOperatorExpression* combineInto = pool().allocate<NAryOperatorExpression>(pool(), NAryOperatorExpression::ShortCircuitAnd);
+			combineInto->addOperand(ifElse->condition);
+			combineInto->addOperand(innerIf->condition);
+			ifElse->condition = combineInto;
+			ifElse->ifBody = innerIf->ifBody;
+		}
 	}
 	
 	intermediate = ifElse;
 }
 
-void AstFlatten::visitLoop(LoopNode* loop)
+void AstFlatten::visitLoop(LoopStatement* loop)
 {
+	DelayedSet<Statement*> result(intermediate);
+	result.value = loop;
+	
 	if (Statement* flattened = flatten(loop->loopBody))
 	{
 		loop->loopBody = flattened;
 		structurizeLoop(loop);
+		if (auto sequence = dyn_cast<SequenceStatement>(loop->loopBody))
+		{
+			auto lastIndex = sequence->statements.size() - 1;
+			if (sequence->statements[lastIndex] == KeywordStatement::breakNode)
+			{
+				sequence->statements.erase_at(lastIndex);
+				if (loop->position == LoopStatement::PreTested)
+				{
+					auto expression = pool().allocate<ExpressionStatement>(loop->condition);
+					push_front<NOT_NULL(Statement)>(sequence->statements, expression);
+				}
+				result.value = sequence;
+			}
+		}
+		else if (flattened == KeywordStatement::breakNode)
+		{
+			result.value = loop->position == LoopStatement::PreTested
+				? pool().allocate<ExpressionStatement>(loop->condition)
+				: nullptr;
+		}
 	}
 	else
 	{
 		// can't assign an empty statement to a loop body, create an empty sequence
-		loop->loopBody = pool().allocate<SequenceNode>(pool());
+		loop->loopBody = pool().allocate<SequenceStatement>(pool());
 	}
-	intermediate = loop;
 }
 
-void AstFlatten::visitAssignment(AssignmentNode *assignment)
+void AstFlatten::visitAssignment(AssignmentStatement *assignment)
 {
 	intermediate = assignment;
 }
 
-void AstFlatten::visitKeyword(KeywordNode* keyword)
+void AstFlatten::visitKeyword(KeywordStatement* keyword)
 {
 	intermediate = keyword;
 }
 
-void AstFlatten::visitExpression(ExpressionNode* expression)
+void AstFlatten::visitExpression(ExpressionStatement* expression)
 {
 	intermediate = expression;
 }
 
-void AstFlatten::visitDeclaration(DeclarationNode* declaration)
+void AstFlatten::visitDeclaration(DeclarationStatement* declaration)
 {
 	intermediate = declaration;
 }

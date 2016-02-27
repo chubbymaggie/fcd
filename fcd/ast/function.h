@@ -19,10 +19,10 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef ast_function_cpp
-#define ast_function_cpp
+#ifndef fcd__ast_function_h
+#define fcd__ast_function_h
 
-#include "nodes.h"
+#include "statements.h"
 #include "dumb_allocator.h"
 #include "llvm_warnings.h"
 
@@ -33,8 +33,6 @@ SILENCE_LLVM_WARNINGS_END()
 
 #include <list>
 #include <unordered_map>
-#include <unordered_set>
-
 
 // The FunctionNode's lifetime is tied to the lifetime of its memory pool (because the lifetime of almost everything it
 // contains is), but it is not itself intended to be allocated through the DumbAllocator interface. FunctionNode needs
@@ -43,9 +41,13 @@ SILENCE_LLVM_WARNINGS_END()
 class FunctionNode
 {
 	llvm::Function& function;
-	std::list<DeclarationNode*> declarations;
+	llvm::Type* returnType = nullptr;
+	std::list<DeclarationStatement*> declarations;
 	std::unordered_map<llvm::Value*, Expression*> valueMap;
+	std::unordered_map<llvm::Value*, Expression*> rawValueMap;
 	std::unordered_map<llvm::Value*, Expression*> lvalueMap;
+	
+	Expression* indexIntoElement(Expression* base, llvm::Type* type, llvm::Value* index);
 	
 	std::string createName(const std::string& prefix) const;
 	Expression* createDeclaration(llvm::Type& type);
@@ -58,16 +60,14 @@ public:
 	typedef decltype(declarations)::iterator declaration_iterator;
 	
 	DumbAllocator pool;
-	Statement* body;
+	Statement* body = nullptr;
 	
 	static void printIntegerConstant(llvm::raw_ostream&& os, uint64_t constant);
 	static void printIntegerConstant(llvm::raw_ostream& os, uint64_t constant);
-	static void printPrototype(llvm::raw_ostream& os, llvm::Function& function);
+	static void printPrototype(llvm::raw_ostream& os, llvm::Function& function, llvm::Type* returnType = nullptr);
 	
-	// HACKHACK: I'm not so comfortable receiving a parameter to help disambiguate the stack poiner
-	// and figure out locals.
-	inline FunctionNode(llvm::Function& fn, llvm::Argument& stackPointer)
-	: function(fn), body(nullptr)
+	inline FunctionNode(llvm::Function& fn)
+	: function(fn)
 	{
 	}
 	
@@ -75,12 +75,20 @@ public:
 	inline declaration_iterator decls_end() { return declarations.end(); }
 	inline declaration_iterator erase(declaration_iterator iter) { return declarations.erase(iter); }
 	
-	SequenceNode* basicBlockToStatement(llvm::BasicBlock& bb);
+	SequenceStatement* basicBlockToStatement(llvm::BasicBlock& bb);
 	Expression* valueFor(llvm::Value& value);
 	inline llvm::Function& getFunction() { return function; }
+	
+	inline void setReturnType(llvm::Type& type) { returnType = &type; }
+	inline llvm::Type& getReturnType() const
+	{
+		return returnType == nullptr ? *function.getReturnType() : *returnType;
+	}
+	
+	bool hasBody() const { return declarations.size() > 0 || body != nullptr; }
 	
 	void print(llvm::raw_ostream& os) const;
 	void dump() const;
 };
 
-#endif /* ast_function_cpp */
+#endif /* fcd__ast_function_h */

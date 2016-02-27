@@ -11,62 +11,89 @@
 // for details.
 //
 
+#include "command_line.h"
 #include "executable.h"
+#include "executable_errors.h"
 #include "elf_executable.h"
+#include "flat_binary.h"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <system_error>
-#include <unistd.h>
-
+using namespace llvm;
 using namespace std;
 
 namespace
 {
-	struct file_descriptor
+	const char elf_magic[4] = {0x7f, 'E', 'L', 'F'};
+	
+	enum ExecutableFormat
 	{
-		int fd;
-		
-		file_descriptor(const string& path, int mode)
-		{
-			fd = open(path.c_str(), mode);
-			if (fd < 0)
-			{
-				throw system_error(errno, system_category());
-			}
-		}
-		
-		operator int() { return fd; }
-		~file_descriptor() { close(fd); }
+		Auto,
+		Elf,
+		FlatBinary,
 	};
 	
-	const char elf_magic[4] = {0x7f, 'E', 'L', 'F'};
+	cl::opt<ExecutableFormat> format("format", cl::desc("Executable format"), cl::value_desc("format"),
+		cl::init(Auto),
+		cl::values(
+			clEnumValN(Auto, "auto", "autodetect"),
+			clEnumValN(Elf, "elf", "ELF"),
+			clEnumValN(FlatBinary, "flat", "flat binary"),
+			clEnumValEnd
+		),
+		whitelist()
+	);
+	
+	cl::alias formatA("f", cl::desc("Alias for --format"), cl::aliasopt(format), whitelist());
 }
 
-pair<const uint8_t*, const uint8_t*> Executable::mmap(const string& path) throw(std::system_error)
+vector<uint64_t> Executable::getVisibleEntryPoints() const
 {
-	file_descriptor fd(path, O_RDONLY);
-	ssize_t length = lseek(fd, 0, SEEK_END);
-	const uint8_t* data = (const uint8_t*)::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (data == MAP_FAILED)
+	vector<uint64_t> result;
+	for (const auto& pair : symbols)
 	{
-		throw system_error(errno, system_category());
+		result.push_back(pair.second.virtualAddress);
 	}
-	return make_pair(data, data + length);
+	return result;
 }
 
-std::unique_ptr<Executable> Executable::parse(const uint8_t* begin, const uint8_t* end)
+const SymbolInfo* Executable::getInfo(uint64_t address) const
 {
-	if (end < begin || end - begin < 4)
+	auto iter = symbols.find(address);
+	if (iter != symbols.end())
 	{
-		return nullptr;
+		return &iter->second;
+	}
+	else if (const uint8_t* memory = map(address))
+	{
+		SymbolInfo& info = symbols[address];
+		info.virtualAddress = address;
+		info.memory = memory;
+		return &info;
+	}
+	return nullptr;
+}
+
+ErrorOr<unique_ptr<Executable>> Executable::parse(const uint8_t* begin, const uint8_t* end)
+{
+	if (format == Auto)
+	{
+		if (memcmp(begin, elf_magic, sizeof elf_magic) == 0)
+		{
+			format = Elf;
+		}
+		else
+		{
+			format = FlatBinary;
+		}
 	}
 	
-	if (memcmp(begin, elf_magic, sizeof elf_magic) == 0)
+	if (format == Elf)
 	{
-		// ELF file
 		return parseElfExecutable(begin, end);
 	}
+	else if (format == FlatBinary)
+	{
+		return parseFlatBinary(begin, end);
+	}
 	
-	return nullptr;
+	return make_error_code(ExecutableParsingError::Generic_UnknownFormat);
 }

@@ -19,13 +19,19 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef __x86Emulator__capstone__
-#define __x86Emulator__capstone__
+#ifndef fcd__capstone_wrapper_h
+#define fcd__capstone_wrapper_h
 
-#include <system_error>
-#include "Capstone.h"
+#include "llvm_warnings.h"
 
-class capstone_error_category : public std::error_category
+SILENCE_LLVM_WARNINGS_BEGIN()
+#include <llvm/Support/ErrorOr.h>
+SILENCE_LLVM_WARNINGS_END()
+
+#include <capstone.h>
+#include <memory>
+
+class capstone_error_category final : public std::error_category
 {
 public:
 	virtual const char* name() const noexcept override;
@@ -67,15 +73,31 @@ public:
 	operation_result next();
 };
 
+struct cs_free_deleter
+{
+	void operator()(cs_insn* that) const
+	{
+		cs_free(that, 1);
+	}
+};
+
 class capstone
 {
 	csh handle;
 	
+	capstone(csh handle);
+	
 public:
-	capstone(cs_arch arch, unsigned mode);
+	typedef std::unique_ptr<cs_insn, cs_free_deleter> inst_ptr;
+	static llvm::ErrorOr<capstone> create(cs_arch arch, unsigned mode);
+	
+	capstone(capstone&& that);
 	~capstone();
 	
+	inst_ptr alloc();
+	
+	bool disassemble(cs_insn* into, const uint8_t* begin, const uint8_t* end, uint64_t virtual_address);
 	capstone_iter begin(const uint8_t* begin, const uint8_t* end, uint64_t virtual_address = 0);
 };
 
-#endif /* defined(__x86Emulator__capstone__) */
+#endif /* defined(fcd__capstone_wrapper_h) */

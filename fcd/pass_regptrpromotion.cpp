@@ -20,6 +20,7 @@
 //
 
 #include "llvm_warnings.h"
+#include "metadata.h"
 #include "passes.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
@@ -29,7 +30,6 @@ SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <llvm/Support/raw_ostream.h>
 SILENCE_LLVM_WARNINGS_END()
 
 using namespace llvm;
@@ -56,19 +56,22 @@ namespace
 		
 		virtual bool runOnFunction(Function& f) override
 		{
-			assert(f.arg_size() == 1);
 			bool modified = false;
-			
-			// Copy arguments to independent list to avoid iterating while modifying.
-			Argument* firstArg = f.arg_begin();
-			SmallVector<User*, 16> users(firstArg->user_begin(), firstArg->user_end());
-			for (auto user : users)
+			if (md::areArgumentsRecoverable(f))
 			{
-				if (auto gep = dyn_cast<GetElementPtrInst>(user))
-				if (isa<StructType>(gep->getResultElementType()))
+				assert(f.arg_size() == 1);
+				
+				// Copy arguments to independent list to avoid iterating while modifying.
+				Argument* firstArg = f.arg_begin();
+				SmallVector<User*, 16> users(firstArg->user_begin(), firstArg->user_end());
+				for (auto user : users)
 				{
-					fixGep(*gep);
-					modified = true;
+					if (auto gep = dyn_cast<GetElementPtrInst>(user))
+					if (isa<StructType>(gep->getResultElementType()))
+					{
+						fixGep(*gep);
+						modified = true;
+					}
 				}
 			}
 			return modified;

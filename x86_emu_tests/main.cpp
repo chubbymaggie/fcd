@@ -12,7 +12,7 @@
 #include <dlfcn.h>
 #include <limits>
 #include <string>
-#include "x86_emulator.h"
+#include "x86.emulator.h"
 
 using namespace std;
 
@@ -49,7 +49,7 @@ namespace
 	typedef void (*test_function)(uintptr_t* result, uint16_t* flags, uintptr_t arg1, uintptr_t arg2);
 	extern "C" const char x86_native_trampoline_call_ret[];
 	extern "C" void x86_native_trampoline(uintptr_t*, uint16_t*, uintptr_t, uintptr_t, test_function, void*);
-	const x86_config config = { 8, X86_REG_RIP, X86_REG_RSP, X86_REG_RBP };
+	const x86_config config = { x86_isa64, 8, X86_REG_RIP, X86_REG_RSP, X86_REG_RBP, };
 
 	template<typename T>
 	uintptr_t as_uintptr(T* value)
@@ -194,12 +194,24 @@ const x86_test_entry tests[] = {
 	{ &x86_test_cmp, OF|SF|ZF|AF|CF|PF, 1, 0 },
 	{ &x86_test_cmp, OF|SF|ZF|AF|CF|PF, 0x8000000000000000, 1 },
 	{ &x86_test_cmp, OF|SF|ZF|AF|CF|PF, 1, 0x8000000000000000 },
+	{ &x86_test_cmp, OF|SF|ZF|AF|CF|PF, 0xff00000000000000, 1 },
+	{ &x86_test_cmp, OF|SF|ZF|AF|CF|PF, 1, 0xff00000000000000 },
 	
 	{ &x86_test_cqo, 0, 0x7fffffffffffffff },
 	{ &x86_test_cqo, 0, 0x8fffffffffffffff },
 	
 	{ &x86_test_dec, OF|SF|ZF|AF|CF|PF, 0 },
 	{ &x86_test_dec, OF|SF|ZF|AF|CF|PF, 0x100 },
+	
+	{ &x86_test_div16_quotient, 0, 1515, 43 },
+	{ &x86_test_div16_remainder, 0, 1515, 43 },
+	{ &x86_test_div16_quotient, 0, 0xea15, 243 }, // ~1515+1 = -1515 without sign confusion
+	{ &x86_test_div16_remainder, 0, 0xea15, 243 },
+	
+	{ &x86_test_div128_quotient, 0, 0x0000babedeadbeef, 0x7acefeedffff },
+	{ &x86_test_div128_remainder, 0, 0x0000babedeadbeef, 0x7acefeedffff },
+	{ &x86_test_div128_quotient, 0, 0x0000babedeadbeef, 0x7acefeedffff },
+	{ &x86_test_div128_remainder, 0, 0x0000babedeadbeef, 0x7acefeedffff },
 	
 	{ &x86_test_idiv16_quotient, 0, 1515, 43 },
 	{ &x86_test_idiv16_remainder, 0, 1515, 43 },

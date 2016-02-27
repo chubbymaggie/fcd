@@ -19,39 +19,39 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef __x86Emulator__asaa__
-#define __x86Emulator__asaa__
+#ifndef fcd__passes_h
+#define fcd__passes_h
 
 #include "llvm_warnings.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Pass.h>
 #include <llvm/Analysis/AliasAnalysis.h>
-#include <llvm/Analysis/CallGraphSCCPass.h>
-#include <llvm/Analysis/LoopPass.h>
 #include <llvm/Analysis/Passes.h>
+#include "MemorySSA.h"
 SILENCE_LLVM_WARNINGS_END()
 
-#include <unordered_map>
-#include <unordered_set>
+#include "pass_argrec.h"
+#include "pass_backend.h"
+#include "pass_executable.h"
+#include "pass_seseloop.h"
+#include "targetinfo.h"
 
-#include "backend.h"
-#include "pass_targetinfo.h"
-#include "pass_reguse.h"
-
-llvm::ImmutablePass* createAddressSpaceAliasAnalysisPass();
-llvm::CallGraphSCCPass* createArgumentRecoveryPass();
-AstBackEnd* createAstBackEnd();
-llvm::FunctionPass* createRegisterPointerPromotionPass();
-RegisterUse* createRegisterUsePass();
-llvm::FunctionPass* createSESELoopPass();
-TargetInfo* createTargetInfoPass();
+llvm::FunctionPass*		createConditionSimplificationPass();
+llvm::ModulePass*		createFixIndirectsPass();
+llvm::ModulePass*		createIdentifyLocalsPass();
+llvm::FunctionPass*		createMemorySSADeadLoadEliminationPass();
+llvm::ModulePass*		createModuleThinnerPass();
+llvm::FunctionPass*		createNoopCastEliminationPass();
+llvm::ImmutablePass*	createProgramMemoryAliasAnalysis();
+llvm::FunctionPass*		createRegisterPointerPromotionPass();
+llvm::FunctionPass*		createSignExtPass();
+TargetInfo*				createTargetInfoPass();
 
 namespace llvm
 {
-	void initializeArgumentRecoveryPass(PassRegistry& pm);
-	void initializeAstBackEndPass(PassRegistry& pm);
-	void initializeSESELoopPass(PassRegistry& pm);
+	void initializeAstBackEndPass(PassRegistry& pr);
+	void initializeSESELoopPass(PassRegistry& pr);
 }
 
-#endif /* defined(__x86Emulator__asaa__) */
+#endif /* defined(fcd__passes_h) */

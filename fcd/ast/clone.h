@@ -19,15 +19,18 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef clone_cpp
-#define clone_cpp
+#ifndef fcd__ast_clone_h
+#define fcd__ast_clone_h
 
 #include "dumb_allocator.h"
 #include "visitor.h"
 
-class ExpressionCloneVisitor : protected ExpressionVisitor
+#include <unordered_map>
+
+class ExpressionCloneVisitor final : protected ExpressionVisitor
 {
 	DumbAllocator& pool;
+	std::unordered_map<Expression*, Expression*> cloned;
 	
 protected:
 	Expression* result;
@@ -39,6 +42,9 @@ protected:
 	virtual void visitToken(TokenExpression* token) override;
 	virtual void visitCall(CallExpression* call) override;
 	virtual void visitCast(CastExpression* cast) override;
+	virtual void visitAggregate(AggregateExpression* agg) override;
+	virtual void visitSubscript(SubscriptExpression* subscript) override;
+	virtual void visitAssembly(AssemblyExpression* assembly) override;
 	
 public:
 	inline ExpressionCloneVisitor(DumbAllocator& pool)
@@ -52,4 +58,4 @@ public:
 	virtual ~ExpressionCloneVisitor() = default;
 };
 
-#endif /* clone_cpp */
+#endif /* fcd__ast_clone_h */

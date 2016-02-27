@@ -24,36 +24,25 @@
 using namespace llvm;
 using namespace std;
 
-void AstRemoveUndef::visitAssignment(AssignmentNode *assignment)
+void AstRemoveUndef::visitAssignment(AssignmentStatement *assignment)
 {
-	if (auto refs = useAnalysis.getReferences(assignment->left))
-	{
-		// Do not erase unused pointer expressions; these have side effects.
-		bool remove = true;
-		if (auto unary = dyn_cast<UnaryOperatorExpression>(refs->expression))
-		if (unary->type == UnaryOperatorExpression::Dereference)
-		{
-			remove = false;
-		}
-		
-		if (remove && refs->uses.size() == 0)
-		{
-			// Useless def(s).
-			auto iter = refs->defs.begin();
-			while (iter != refs->defs.end())
-			{
-				iter = useAnalysis.removeDef(iter);
-			}
-		}
-	}
-	
 	if (assignment->right == TokenExpression::undefExpression)
 	{
 		toErase = assignment;
 	}
+	else
+	{
+		if (auto token = dyn_cast<TokenExpression>(assignment->left))
+		{
+			tokenInfo[token].assignments.push_back(assignment);
+		}
+		
+		assignment->left->visit(*this);
+		assignment->right->visit(*this);
+	}
 }
 
-void AstRemoveUndef::visitSequence(SequenceNode *sequence)
+void AstRemoveUndef::visitSequence(SequenceStatement *sequence)
 {
 	// Visit sequences in reverse order. This allows us to delete values with dependences.
 	auto& statements = sequence->statements;
@@ -76,7 +65,7 @@ void AstRemoveUndef::visitSequence(SequenceNode *sequence)
 	}
 }
 
-void AstRemoveUndef::visitLoop(LoopNode *loop)
+void AstRemoveUndef::visitLoop(LoopStatement *loop)
 {
 	loop->loopBody->visit(*this);
 	if (toErase == loop->loopBody)
@@ -85,7 +74,7 @@ void AstRemoveUndef::visitLoop(LoopNode *loop)
 	}
 }
 
-void AstRemoveUndef::visitIfElse(IfElseNode *ifElse)
+void AstRemoveUndef::visitIfElse(IfElseStatement *ifElse)
 {
 	if (auto elseBody = ifElse->elseBody)
 	{
@@ -112,8 +101,28 @@ void AstRemoveUndef::visitIfElse(IfElseNode *ifElse)
 	}
 }
 
+void AstRemoveUndef::visitKeyword(KeywordStatement *keyword)
+{
+	if (auto op = keyword->operand)
+	{
+		op->visit(*this);
+	}
+}
+
+void AstRemoveUndef::visitToken(TokenExpression* token)
+{
+	tokenInfo[token].useCount++;
+}
+
 void AstRemoveUndef::doRun(FunctionNode &fn)
 {
+	// XXX: this is inefficient as there is no use list for statements (or expressions).
+	// We need to walk over the AST twice, the first time to identify things to delete
+	// and the second time to actually delete them.
+	
+	tokenInfo.clear();
+	currentFunction = &fn;
+	
 	// Remove undefined statements.
 	fn.body->visit(*this);
 	if (toErase == fn.body)
@@ -122,22 +131,36 @@ void AstRemoveUndef::doRun(FunctionNode &fn)
 	}
 	
 	// Remove unused declarations.
+	
 	auto iter = fn.decls_begin();
 	while (iter != fn.decls_end())
 	{
-		if (auto refs = useAnalysis.getReferences((*iter)->name))
+		TokenExpression* token = (*iter)->name;
+		const auto& info = tokenInfo[token];
+		if (info.useCount == info.assignments.size())
 		{
-			if (refs->uses.size() + refs->defs.size() == 0)
+			for (auto assignment : info.assignments)
 			{
-				iter = fn.erase(iter);
-				continue;
+				assignment->left = TokenExpression::undefExpression;
+				assignment->right = TokenExpression::undefExpression;
 			}
+			iter = fn.erase(iter);
 		}
-		++iter;
+		else
+		{
+			++iter;
+		}
 	}
+	
+	// Delete assignments that were undefined.
+	fn.body->visit(*this);
 }
 
 const char* AstRemoveUndef::getName() const
 {
 	return "Remove undefined assignments";
+}
+
+AstRemoveUndef::~AstRemoveUndef()
+{
 }

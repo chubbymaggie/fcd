@@ -19,13 +19,13 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef pass_flatten_cpp
-#define pass_flatten_cpp
+#ifndef fcd__ast_pass_flatten_h
+#define fcd__ast_pass_flatten_h
 
 #include "pass.h"
 #include "visitor.h"
 
-class AstFlatten : public AstPass, private StatementVisitor
+class AstFlatten final : public AstFunctionPass, private StatementVisitor
 {
 	Statement* intermediate;
 	
@@ -41,16 +41,16 @@ class AstFlatten : public AstPass, private StatementVisitor
 		return intermediate;
 	}
 	
-	void removeBranch(SequenceNode& parent, size_t ifIndex, bool branch);
-	void structurizeLoop(LoopNode* loop);
+	void removeBranch(SequenceStatement& parent, size_t ifIndex, bool branch);
+	void structurizeLoop(LoopStatement* loop);
 	
-	virtual void visitSequence(SequenceNode* sequence) override;
-	virtual void visitIfElse(IfElseNode* ifElse) override;
-	virtual void visitLoop(LoopNode* loop) override;
-	virtual void visitKeyword(KeywordNode* keyword) override;
-	virtual void visitExpression(ExpressionNode* expression) override;
-	virtual void visitDeclaration(DeclarationNode* declaration) override;
-	virtual void visitAssignment(AssignmentNode* assignment) override;
+	virtual void visitSequence(SequenceStatement* sequence) override;
+	virtual void visitIfElse(IfElseStatement* ifElse) override;
+	virtual void visitLoop(LoopStatement* loop) override;
+	virtual void visitKeyword(KeywordStatement* keyword) override;
+	virtual void visitExpression(ExpressionStatement* expression) override;
+	virtual void visitDeclaration(DeclarationStatement* declaration) override;
+	virtual void visitAssignment(AssignmentStatement* assignment) override;
 	
 protected:
 	virtual void doRun(FunctionNode& fn) override;
@@ -59,4 +59,4 @@ public:
 	virtual const char* getName() const override;
 };
 
-#endif /* pass_flatten_cpp */
+#endif /* fcd__ast_pass_flatten_h */

@@ -19,8 +19,8 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef print_cpp
-#define print_cpp
+#ifndef fcd__ast_print_h
+#define fcd__ast_print_h
 
 #include "llvm_warnings.h"
 #include "visitor.h"
@@ -31,7 +31,7 @@ SILENCE_LLVM_WARNINGS_END()
 
 #include <string>
 
-class ExpressionPrintVisitor : public ExpressionVisitor
+class ExpressionPrintVisitor final : public ExpressionVisitor
 {
 	llvm::raw_ostream& os;
 
@@ -50,11 +50,14 @@ public:
 	virtual void visitToken(TokenExpression* token) override;
 	virtual void visitCall(CallExpression* call) override;
 	virtual void visitCast(CastExpression* cast) override;
+	virtual void visitAggregate(AggregateExpression* agg) override;
+	virtual void visitSubscript(SubscriptExpression* subscript) override;
+	virtual void visitAssembly(AssemblyExpression* assembly) override;
 	
 	virtual ~ExpressionPrintVisitor() = default;
 };
 
-class StatementPrintVisitor : public StatementVisitor
+class StatementPrintVisitor final : public StatementVisitor
 {
 	ExpressionPrintVisitor expressionPrinter;
 	
@@ -63,7 +66,7 @@ class StatementPrintVisitor : public StatementVisitor
 	
 	std::string indent() const;
 	void printWithIndent(Statement* statement);
-	void visitIfElse(IfElseNode* ifElse, const std::string& firstLineIndent);
+	void visitIfElse(IfElseStatement* ifElse, const std::string& firstLineIndent);
 	
 public:
 	inline StatementPrintVisitor(llvm::raw_ostream& os, unsigned indentCount = 0)
@@ -71,18 +74,18 @@ public:
 	{
 	}
 	
-	virtual void visitSequence(SequenceNode* sequence) override;
-	virtual void visitIfElse(IfElseNode* ifElse) override;
-	virtual void visitLoop(LoopNode* loop) override;
-	virtual void visitKeyword(KeywordNode* keyword) override;
-	virtual void visitExpression(ExpressionNode* expression) override;
-	virtual void visitDeclaration(DeclarationNode* declaration) override;
-	virtual void visitAssignment(AssignmentNode* assignment) override;
+	virtual void visitSequence(SequenceStatement* sequence) override;
+	virtual void visitIfElse(IfElseStatement* ifElse) override;
+	virtual void visitLoop(LoopStatement* loop) override;
+	virtual void visitKeyword(KeywordStatement* keyword) override;
+	virtual void visitExpression(ExpressionStatement* expression) override;
+	virtual void visitDeclaration(DeclarationStatement* declaration) override;
+	virtual void visitAssignment(AssignmentStatement* assignment) override;
 	
 	virtual ~StatementPrintVisitor() = default;
 };
 
-class StatementShortPrintVisitor : public StatementVisitor
+class StatementShortPrintVisitor final : public StatementVisitor
 {
 	ExpressionPrintVisitor expressionPrinter;
 	llvm::raw_ostream& os;
@@ -93,15 +96,15 @@ public:
 	{
 	}
 	
-	virtual void visitSequence(SequenceNode* sequence) override;
-	virtual void visitIfElse(IfElseNode* ifElse) override;
-	virtual void visitLoop(LoopNode* loop) override;
-	virtual void visitKeyword(KeywordNode* keyword) override;
-	virtual void visitExpression(ExpressionNode* expression) override;
-	virtual void visitDeclaration(DeclarationNode* declaration) override;
-	virtual void visitAssignment(AssignmentNode* assignment) override;
+	virtual void visitSequence(SequenceStatement* sequence) override;
+	virtual void visitIfElse(IfElseStatement* ifElse) override;
+	virtual void visitLoop(LoopStatement* loop) override;
+	virtual void visitKeyword(KeywordStatement* keyword) override;
+	virtual void visitExpression(ExpressionStatement* expression) override;
+	virtual void visitDeclaration(DeclarationStatement* declaration) override;
+	virtual void visitAssignment(AssignmentStatement* assignment) override;
 	
 	virtual ~StatementShortPrintVisitor() = default;
 };
 
-#endif /* print_cpp */
+#endif /* fcd__ast_print_h */

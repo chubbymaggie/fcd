@@ -10,15 +10,18 @@
 // either license, at your choice.
 //
 
-#ifndef dumb_allocator_cpp
-#define dumb_allocator_cpp
+#ifndef fcd__dumb_allocator_h
+#define fcd__dumb_allocator_h
 
 #include <algorithm>
 #include <cassert>
 #include <iterator>
 #include <list>
 #include <memory>
+#include <cstring>
 #include <type_traits>
+
+#include <iostream>
 
 // This class provides a fast, stack-like allocation mechanism. It's a lot faster than using a raw `new` for every
 // small object we create, and a lot easier to manage: since the objects are enforced to be trivially destructible,
@@ -35,9 +38,11 @@ class DumbAllocator
 	
 	inline char* allocateSmall(size_t size)
 	{
+		assert(size <= DefaultPageSize);
 		if (offset < size)
 		{
-			pool.emplace_back(new char[DefaultPageSize]);
+			char* bytes = new char[DefaultPageSize];
+			pool.emplace_back(bytes);
 			offset = DefaultPageSize;
 		}
 		
@@ -47,7 +52,8 @@ class DumbAllocator
 	
 	inline char* allocateLarge(size_t size)
 	{
-		pool.emplace_front(new char[size]);
+		char* bytes = new char[size];
+		pool.emplace_front(bytes);
 		return pool.front().get();
 	}
 	
@@ -90,20 +96,24 @@ public:
 			return nullptr;
 		}
 		
-		if (DefaultPageSize - offset < totalSize || totalSize < HalfPageSize)
+		if (totalSize < HalfPageSize)
 		{
 			return new (allocateSmall(totalSize)) T[count];
 		}
 		return new (allocateLarge(totalSize)) T[count];
 	}
 	
-	template<typename T>
-	T* copy(T* origin, size_t count)
+	char* copyString(const char* begin, const char* end)
 	{
-		if (auto memory = allocateDynamic<typename std::remove_cv<T>::type>(count))
+		if (end >= begin)
 		{
-			std::copy(origin, origin + count, memory);
-			return memory;
+			size_t size = size_t(end - begin);
+			if (auto memory = allocateDynamic<char>(size + 1))
+			{
+				std::copy(begin, end, memory);
+				memory[size] = 0;
+				return memory;
+			}
 		}
 		return nullptr;
 	}
@@ -385,4 +395,4 @@ public:
 template<typename T>
 PooledDequeBuffer<T> PooledDeque<T>::empty = PooledDequeBuffer<T>();
 
-#endif /* dumb_allocator_cpp */
+#endif /* fcd__dumb_allocator_h */

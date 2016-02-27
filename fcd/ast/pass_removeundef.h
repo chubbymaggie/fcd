@@ -19,33 +19,45 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef pass_removeundef_cpp
-#define pass_removeundef_cpp
+#ifndef fcd__ast_pass_removeundef_h
+#define fcd__ast_pass_removeundef_h
 
 #include "pass.h"
-#include "pass_variablereferences.h"
 #include "visitor.h"
 
-class AstRemoveUndef : public AstPass, private StatementVisitor
+#include <unordered_map>
+
+class AstRemoveUndef final : public AstFunctionPass, private StatementVisitor, private ExpressionVisitor
 {
-	AstVariableReferences& useAnalysis;
-	Statement* toErase;
+	struct TokenInfo
+	{
+		llvm::SmallVector<AssignmentStatement*, 1> assignments;
+		long useCount;
+		
+		TokenInfo()
+		: useCount(0)
+		{
+		}
+	};
 	
-	virtual void visitAssignment(AssignmentNode* assignment) override;
-	virtual void visitSequence(SequenceNode* sequence) override;
-	virtual void visitLoop(LoopNode* loop) override;
-	virtual void visitIfElse(IfElseNode* ifElse) override;
+	Statement* toErase;
+	FunctionNode* currentFunction;
+	std::unordered_map<TokenExpression*, TokenInfo> tokenInfo;
+	
+	virtual void visitAssignment(AssignmentStatement* assignment) override;
+	virtual void visitSequence(SequenceStatement* sequence) override;
+	virtual void visitLoop(LoopStatement* loop) override;
+	virtual void visitIfElse(IfElseStatement* ifElse) override;
+	virtual void visitKeyword(KeywordStatement* kw) override;
+	
+	virtual void visitToken(TokenExpression* token) override;
 	
 protected:
 	virtual void doRun(FunctionNode& fn) override;
 	
 public:
-	inline AstRemoveUndef(AstVariableReferences& refs)
-	: useAnalysis(refs)
-	{
-	}
-	
 	virtual const char* getName() const override;
+	virtual ~AstRemoveUndef();
 };
 
-#endif /* pass_removeundef_cpp */
+#endif /* fcd__ast_pass_removeundef_h */

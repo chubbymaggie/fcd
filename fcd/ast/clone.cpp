@@ -70,7 +70,27 @@ void ExpressionCloneVisitor::visitCall(CallExpression *call)
 
 void ExpressionCloneVisitor::visitCast(CastExpression *cast)
 {
-	result = pool.allocate<CastExpression>(static_cast<TokenExpression*>(clone(cast->type)), clone(cast->casted));
+	result = pool.allocate<CastExpression>(static_cast<TokenExpression*>(clone(cast->type)), clone(cast->casted), cast->sign);
+}
+
+void ExpressionCloneVisitor::visitAggregate(AggregateExpression *agg)
+{
+	auto copy = pool.allocate<AggregateExpression>(pool);
+	for (auto value : agg->values)
+	{
+		copy->values.push_back(clone(value));
+	}
+	result = copy;
+}
+
+void ExpressionCloneVisitor::visitSubscript(SubscriptExpression *subscript)
+{
+	result = pool.allocate<SubscriptExpression>(clone(subscript->left), subscript->index);
+}
+
+void ExpressionCloneVisitor::visitAssembly(AssemblyExpression *assembly)
+{
+	result = pool.allocate<AssemblyExpression>(pool, *assembly);
 }
 
 Expression* ExpressionCloneVisitor::clone(DumbAllocator &pool, Expression *that)
@@ -80,6 +100,11 @@ Expression* ExpressionCloneVisitor::clone(DumbAllocator &pool, Expression *that)
 
 Expression* ExpressionCloneVisitor::clone(Expression* that)
 {
-	that->visit(*this);
-	return result;
+	Expression*& existingClone = cloned[that];
+	if (existingClone == nullptr)
+	{
+		that->visit(*this);
+		existingClone = result;
+	}
+	return existingClone;
 }

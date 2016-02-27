@@ -9,22 +9,48 @@
 #include <algorithm>
 #include <cassert>
 #include <csetjmp>
+#include <dlfcn.h>
 #include <iostream>
 
 #include "capstone_wrapper.h"
-#include "x86_emulator.h"
+#include "x86.emulator.h"
 
 using namespace std;
 
 namespace
 {
+	template<typename T, size_t N>
+	constexpr size_t countof(T (&)[N])
+	{
+		return N;
+	}
+	
 	jmp_buf jump_to;
 
 	typedef void (*x86_impl)(CPTR(x86_config), CPTR(cs_x86), PTR(x86_regs), PTR(x86_flags_reg));
-	x86_impl emulator_funcs[] = {
-#define X86_INSTRUCTION_DECL(enum, shortName) [enum] = &x86_##shortName,
-#include "x86_defs.h"
+	
+	const char* emulator_func_names[X86_INS_ENDING] = {
+		"", // X86_INS_INVALID
+		
+#define X86_INSTRUCTION_DECL(enum, shortName) [enum] = "x86_" #shortName,
+#include "x86_insts.h"
 	};
+	
+	x86_impl get_emulator_impl(x86_insn inst)
+	{
+		static bool initialized = false;
+		static x86_impl emulator_funcs[X86_INS_ENDING];
+		if (!initialized)
+		{
+			for (size_t i = 0; i < X86_INS_ENDING; ++i)
+			{
+				emulator_funcs[i] = reinterpret_cast<x86_impl>(dlsym(RTLD_MAIN_ONLY, emulator_func_names[i]));
+			}
+			initialized = true;
+		}
+		
+		return emulator_funcs[inst];
+	}
 	
 	template<typename TInt>
 	void write_at(uintptr_t address, uint64_t value)
@@ -93,14 +119,25 @@ extern "C" void x86_call_intrin(CPTR(x86_config) config, PTR(x86_regs) regs, uin
 	copy(begin(jump_to), end(jump_to), begin(previous));
 
 	x86_flags_reg flags;
-	capstone cs(CS_ARCH_X86, CS_MODE_LITTLE_ENDIAN | size);
+	unique_ptr<capstone> cs;
+	if (auto csHandle = capstone::create(CS_ARCH_X86, CS_MODE_LITTLE_ENDIAN | size))
+	{
+		cs.reset(new capstone(move(csHandle.get())));
+	}
+	else
+	{
+		// This is REALLY not supposed to happen. The parameters are static.
+		// XXX: If/when we have other architectures, change this to something non-fatal.
+		cerr << "couldn't open Capstone handle: " << csHandle.getError().message() << endl;
+		abort();
+	}
 	
 	bool print = true;
 	while (true)
 	{
 		auto code_begin = reinterpret_cast<const uint8_t*>(regs->ip.qword);
 		auto code_end = reinterpret_cast<const uint8_t*>(UINTPTR_MAX);
-		auto iter = cs.begin(code_begin, code_end, regs->ip.qword);
+		auto iter = cs->begin(code_begin, code_end, regs->ip.qword);
 		
 		int cause = setjmp(jump_to);
 		if (cause == 0)
@@ -114,7 +151,14 @@ extern "C" void x86_call_intrin(CPTR(x86_config) config, PTR(x86_regs) regs, uin
 				}
 				
 				regs->ip.qword = iter.next_address();
-				emulator_funcs[iter->id](config, &iter->detail->x86, regs, &flags);
+				if (x86_impl implementation = get_emulator_impl(static_cast<x86_insn>(iter->id)))
+				{
+					implementation(config, &iter->detail->x86, regs, &flags);
+				}
+				else
+				{
+					x86_assertion_failure("Instruction not implemented");
+				}
 			}
 			assert(!"unreachable");
 		}
@@ -152,9 +196,4 @@ NORETURN extern "C" void x86_assertion_failure(CPTR(char) problem)
 {
 	cerr << problem << endl;
 	abort();
-}
-
-NORETURN extern "C" void x86_unimplemented(PTR(x86_regs), CPTR(char) inst)
-{
-	x86_assertion_failure("Instruction not implemented");
 }

@@ -19,25 +19,18 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef ast_pass_propagatevalues_cpp
-#define ast_pass_propagatevalues_cpp
+#ifndef fcd__ast_pass_propagatevalues_h
+#define fcd__ast_pass_propagatevalues_h
 
 #include "pass.h"
-#include "pass_variablereferences.h"
 
-class AstPropagateValues : public AstPass
+class AstPropagateValues final : public AstFunctionPass
 {
-	AstVariableReferences& useAnalysis;
-	
-	void attemptToPropagateUses(VariableReferences& uses);
-	
 protected:
 	virtual void doRun(FunctionNode& fn) override;
 	
 public:
-	AstPropagateValues(AstVariableReferences& uses);
-	
 	virtual const char* getName() const override;
 };
 
-#endif /* ast_pass_propagatevalues_cpp */
+#endif /* fcd__ast_pass_propagatevalues_h */

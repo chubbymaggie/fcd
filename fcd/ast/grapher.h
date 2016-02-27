@@ -19,10 +19,10 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef ast_grapher_cpp
-#define ast_grapher_cpp
+#ifndef fcd__ast_grapher_h
+#define fcd__ast_grapher_h
 
-#include "nodes.h"
+#include "statements.h"
 #include "dumb_allocator.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
@@ -37,7 +37,7 @@ class AstGrapher;
 
 class AstGraphNode
 {
-	friend class llvm::GraphTraits<AstGraphNode>;
+	friend struct llvm::GraphTraits<AstGraphNode>;
 	AstGrapher& grapher;
 	
 	llvm::BasicBlock* entry;
@@ -83,4 +83,4 @@ public:
 	inline const_iterator end() const { return nodeStorage.end(); }
 };
 
-#endif /* ast_grapher_cpp */
+#endif /* fcd__ast_grapher_h */

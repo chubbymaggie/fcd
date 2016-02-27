@@ -19,29 +19,48 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef ast_pass_cpp
-#define ast_pass_cpp
+#ifndef fcd__ast_pass_h
+#define fcd__ast_pass_h
 
 #include "function.h"
 
+#include <deque>
+
 // Lifetime management for an AST pass is the same as for a LLVM pass: the pass manager owns it.
-class AstPass
+class AstModulePass
+{
+protected:
+	virtual void doRun(std::deque<std::unique_ptr<FunctionNode>>& functions) = 0;
+	
+public:
+	virtual const char* getName() const = 0;
+	void run(std::deque<std::unique_ptr<FunctionNode>>& functions);
+	virtual ~AstModulePass() = default;
+};
+
+class AstFunctionPass : public AstModulePass
 {
 	DumbAllocator* pool_;
+	bool runOnDeclarations;
 	
 protected:
+	inline DumbAllocator& pool() { return *pool_; }
+	
 	// Transformation helpers.
 	Expression* negate(Expression* that);
 	Expression* append(NAryOperatorExpression::NAryOperatorType opcode, Expression* a, Expression* b);
 	Statement* append(Statement* a, Statement* b);
 	
-	virtual void doRun(FunctionNode& fn) = 0;
-	inline DumbAllocator& pool() { return *pool_; }
+	virtual void doRun(std::deque<std::unique_ptr<FunctionNode>>& function) override final;
+	virtual void doRun(FunctionNode& function) = 0;
 	
 public:
-	virtual const char* getName() const = 0;
-	void run(FunctionNode& fn);
-	virtual ~AstPass() = default;
+	AstFunctionPass(bool runOnDeclarations = false)
+	: runOnDeclarations(runOnDeclarations)
+	{
+	}
+	
+	virtual ~AstFunctionPass() = default;
 };
 
-#endif /* ast_pass_cpp */
+#endif /* fcd__ast_pass_h */

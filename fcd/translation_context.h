@@ -19,12 +19,15 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef __x86Emulator__translation_context__
-#define __x86Emulator__translation_context__
+#ifndef fcd__translation_context_h
+#define fcd__translation_context_h
 
+#include "capstone_wrapper.h"
+#include "code_generator.h"
+#include "executable.h"
 #include "llvm_warnings.h"
-
-#include <functional>
+#include "targetinfo.h"
+#include "x86_regs.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/DerivedTypes.h>
@@ -33,53 +36,36 @@ SILENCE_LLVM_WARNINGS_BEGIN()
 SILENCE_LLVM_WARNINGS_END()
 
 #include <memory>
-#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
-#include "capstone_wrapper.h"
-#include "result_function.h"
+class CodeGenerator;
+class AddressToFunction;
 
-SILENCE_LLVM_WARNINGS_BEGIN()
-#include "x86.h"
-SILENCE_LLVM_WARNINGS_END()
-
-#include "x86_emulator.h"
-
-class translation_context
+class TranslationContext
 {
 	llvm::LLVMContext& context;
+	std::unique_ptr<capstone> cs;
+	std::unique_ptr<CodeGenerator> irgen;
 	std::unique_ptr<llvm::Module> module;
-	std::unordered_map<uint64_t, std::string> aliases;
-	capstone cs;
-	x86 irgen;
-	llvm::legacy::FunctionPassManager clarifyInstruction;
+	std::unique_ptr<AddressToFunction> functionMap;
 	
-	llvm::Type* voidTy;
-	llvm::Type* int8Ty;
-	llvm::Type* int16Ty;
-	llvm::Type* int32Ty;
-	llvm::Type* int64Ty;
-	llvm::StructType* x86RegsTy;
-	llvm::StructType* x86FlagsTy;
-	llvm::StructType* x86ConfigTy;
 	llvm::FunctionType* resultFnTy;
-	llvm::GlobalVariable* x86Config;
+	llvm::GlobalVariable* configVariable;
 	
-	llvm::CastInst& get_pointer(llvm::Value* intptr, size_t size);
-	void resolve_intrinsics(result_function& fn, std::unordered_set<uint64_t>& new_labels);
-	llvm::Constant* cs_struct(const cs_x86& x86);
-	llvm::Function* single_step(llvm::Value* flags, const cs_insn& inst);
+	llvm::CastInst& getPointer(llvm::Value* intptr, size_t size);
+	std::string nameOf(uint64_t address) const;
 	
 public:
-	translation_context(llvm::LLVMContext& context, const x86_config& config, const std::string& module_name = "");
-	~translation_context();
+	TranslationContext(llvm::LLVMContext& context, const x86_config& config, const std::string& module_name = "");
+	~TranslationContext();
 	
-	void create_alias(uint64_t address, const std::string& name);
-	result_function create_function(const std::string& name, uint64_t base_address, const uint8_t* begin, const uint8_t* end);
+	void setFunctionName(uint64_t address, const std::string& name);
+	llvm::Function* createFunction(Executable& executable, uint64_t base_address);
+	std::unordered_set<uint64_t> getDiscoveredEntryPoints() const;
 	
 	inline llvm::Module* operator->() { return module.get(); }
 	std::unique_ptr<llvm::Module> take();
 };
 
-#endif /* defined(__x86Emulator__translation_context__) */
+#endif /* defined(fcd__translation_context_h) */
