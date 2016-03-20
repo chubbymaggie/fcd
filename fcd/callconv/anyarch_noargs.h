@@ -1,5 +1,5 @@
 //
-// pass_propagatevalues.h
+// anyarch_noargs.h
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
@@ -19,18 +19,24 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-#ifndef fcd__ast_pass_propagatevalues_h
-#define fcd__ast_pass_propagatevalues_h
+#ifndef anyarch_noargs_hpp
+#define anyarch_noargs_hpp
 
-#include "pass.h"
+#include "call_conv.h"
+#include "params_registry.h"
 
-class AstPropagateValues final : public AstFunctionPass
+class CallingConvention_AnyArch_NoArgs : public CallingConvention
 {
-protected:
-	virtual void doRun(FunctionNode& fn) override;
-	
 public:
+	static const char* name;
+	
 	virtual const char* getName() const override;
+	virtual const char* getHelp() const override;
+	
+	virtual bool matches(TargetInfo& target, Executable& executable) const override;
+	virtual bool analyzeFunction(ParameterRegistry& registry, CallInformation& fillOut, llvm::Function& func) override;
+	virtual bool analyzeFunctionType(ParameterRegistry& registry, CallInformation& fillOut, llvm::FunctionType& type) override;
+	virtual bool analyzeCallSite(ParameterRegistry& registry, CallInformation& fillOut, llvm::CallSite cs) override;
 };
 
-#endif /* fcd__ast_pass_propagatevalues_h */
+#endif /* anyarch_noargs_hpp */

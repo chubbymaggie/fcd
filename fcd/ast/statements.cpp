@@ -31,68 +31,140 @@ SILENCE_LLVM_WARNINGS_END()
 using namespace llvm;
 using namespace std;
 
-namespace
+void NoopStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
 {
-	KeywordStatement breakNode("break");
+	llvm_unreachable("noop statements cannot have children");
 }
 
-#pragma mark - Statements
-
-void Statement::dump() const
+void ExpressionStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
 {
-	print(errs());
+	llvm_unreachable("expression statements cannot have children");
 }
 
-void Statement::printShort(raw_ostream& os) const
+Statement* SequenceStatement::replace(iterator iter, NOT_NULL(Statement) newStatement)
 {
-	StatementShortPrintVisitor print(os);
-	const_cast<Statement&>(*this).visit(print);
+	if (*iter == newStatement)
+	{
+		return nullptr;
+	}
+	
+	Statement* old = *iter;
+	disown(old);
+	*iter = newStatement;
+	takeChild(newStatement);
+	return old;
 }
 
-void Statement::print(raw_ostream& os) const
+void SequenceStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
 {
-	StatementPrintVisitor print(os);
-	const_cast<Statement&>(*this).visit(print);
+	for (auto iter = statements.begin(); iter != statements.end(); ++iter)
+	{
+		if (*iter == child)
+		{
+			replace(iter, newChild);
+			return;
+		}
+	}
+	llvm_unreachable("child not found in sequence statement");
 }
 
-void SequenceStatement::visit(StatementVisitor &visitor)
+void SequenceStatement::pushBack(NOT_NULL(Statement) statement)
 {
-	visitor.visitSequence(this);
+	takeChild(statement);
+	statements.push_back(statement);
 }
 
-void IfElseStatement::visit(StatementVisitor &visitor)
+void SequenceStatement::takeAllFrom(SequenceStatement &sequence)
 {
-	visitor.visitIfElse(this);
+	for (Statement* statement : sequence)
+	{
+		sequence.disown(statement);
+		takeChild(statement);
+		statements.push_back(statement);
+	}
+	sequence.statements.clear();
 }
 
-LoopStatement::LoopStatement(Statement* body)
-: LoopStatement(TokenExpression::trueExpression, PreTested, body)
+void IfElseStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
 {
+	if (child == ifBody)
+	{
+		setIfBody(newChild);
+		return;
+	}
+	if (child == elseBody)
+	{
+		setElseBody(newChild);
+		return;
+	}
+	llvm_unreachable("child not found in if statement");
 }
 
-void LoopStatement::visit(StatementVisitor &visitor)
+Statement* IfElseStatement::setIfBody(NOT_NULL(Statement) statement)
 {
-	visitor.visitLoop(this);
+	Statement* old = ifBody;
+	if (old == statement)
+	{
+		return nullptr;
+	}
+	
+	if (old != nullptr)
+	{
+		disown(old);
+	}
+	ifBody = statement;
+	takeChild(ifBody);
+	return old;
 }
 
-KeywordStatement* KeywordStatement::breakNode = &::breakNode;
-
-void KeywordStatement::visit(StatementVisitor &visitor)
+Statement* IfElseStatement::setElseBody(Statement *statement)
 {
-	visitor.visitKeyword(this);
+	Statement* old = elseBody;
+	if (old == statement)
+	{
+		return nullptr;
+	}
+	
+	if (old != nullptr)
+	{
+		disown(old);
+	}
+	elseBody = statement;
+	if (elseBody != nullptr)
+	{
+		takeChild(elseBody);
+	}
+	return old;
 }
 
-void ExpressionStatement::visit(StatementVisitor &visitor)
+void LoopStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
 {
-	visitor.visitExpression(this);
+	if (child == loopBody)
+	{
+		setLoopBody(newChild);
+		return;
+	}
+	llvm_unreachable("child not found in loop statement");
 }
 
-void DeclarationStatement::visit(StatementVisitor &visitor)
+Statement* LoopStatement::setLoopBody(NOT_NULL(Statement) statement)
 {
-	visitor.visitDeclaration(this);
+	Statement* old = loopBody;
+	if (old == statement)
+	{
+		return nullptr;
+	}
+	
+	if (old != nullptr)
+	{
+		disown(old);
+	}
+	loopBody = statement;
+	takeChild(loopBody);
+	return old;
 }
 
-void AssignmentStatement::visit(StatementVisitor &visitor)
+void KeywordStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
 {
-	visitor.visitAssignment(this);
+	llvm_unreachable("keyword statements cannot have children");
 }

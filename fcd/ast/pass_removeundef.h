@@ -27,37 +27,14 @@
 
 #include <unordered_map>
 
-class AstRemoveUndef final : public AstFunctionPass, private StatementVisitor, private ExpressionVisitor
+// Removes assignments to __undefined.
+class AstRemoveUndef final : public AstFunctionPass
 {
-	struct TokenInfo
-	{
-		llvm::SmallVector<AssignmentStatement*, 1> assignments;
-		long useCount;
-		
-		TokenInfo()
-		: useCount(0)
-		{
-		}
-	};
-	
-	Statement* toErase;
-	FunctionNode* currentFunction;
-	std::unordered_map<TokenExpression*, TokenInfo> tokenInfo;
-	
-	virtual void visitAssignment(AssignmentStatement* assignment) override;
-	virtual void visitSequence(SequenceStatement* sequence) override;
-	virtual void visitLoop(LoopStatement* loop) override;
-	virtual void visitIfElse(IfElseStatement* ifElse) override;
-	virtual void visitKeyword(KeywordStatement* kw) override;
-	
-	virtual void visitToken(TokenExpression* token) override;
-	
 protected:
 	virtual void doRun(FunctionNode& fn) override;
 	
 public:
 	virtual const char* getName() const override;
-	virtual ~AstRemoveUndef();
 };
 
 #endif /* fcd__ast_pass_removeundef_h */

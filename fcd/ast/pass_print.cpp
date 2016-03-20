@@ -20,14 +20,19 @@
 //
 
 #include "pass_print.h"
+#include "clone.h"
 
 using namespace llvm;
 using namespace std;
 
 void AstPrint::doRun(deque<std::unique_ptr<FunctionNode>> &functions)
 {
-	for (std::unique_ptr<FunctionNode>& fn : functions)
+	for (unique_ptr<FunctionNode>& fn : functions)
 	{
+		if (auto body = fn->getBody())
+		{
+			fn->setBody(CloneVisitor::clone(fn->getContext(), *body));
+		}
 		fn->print(output);
 	}
 }

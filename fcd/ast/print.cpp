@@ -19,8 +19,10 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
+#include "expression_type.h"
 #include "print.h"
 
+#include <cctype>
 #include <limits>
 #include <string>
 
@@ -35,12 +37,164 @@ namespace
 		return N;
 	}
 	
+	class CTypePrinter
+	{
+		static void printMiddleIfAny(raw_ostream& os, const string& middle)
+		{
+			if (middle.size() > 0)
+			{
+				if (isalpha(middle[0]))
+				{
+					os << ' ';
+				}
+				os << middle;
+			}
+		}
+		
+		static void print(raw_ostream& os, const VoidExpressionType&, string middle)
+		{
+			os << "void";
+			printMiddleIfAny(os, middle);
+		}
+		
+		static void print(raw_ostream& os, const IntegerExpressionType& intTy, string middle)
+		{
+			if (intTy.getBits() == 1)
+			{
+				os << "bool";
+			}
+			else
+			{
+				os << (intTy.isSigned() ? "" : "u") << "int" << intTy.getBits() << "_t";
+			}
+			printMiddleIfAny(os, middle);
+		}
+		
+		static void print(raw_ostream& os, const PointerExpressionType& pointerTy, string middle)
+		{
+			string tempMiddle;
+			raw_string_ostream midOs(tempMiddle);
+			const auto& nestedType = pointerTy.getNestedType();
+			bool wrapWithParentheses = isa<ArrayExpressionType>(nestedType) || isa<FunctionExpressionType>(nestedType);
+			
+			if (wrapWithParentheses) midOs << '(';
+			midOs << '*';
+			printMiddleIfAny(midOs, middle);
+			if (wrapWithParentheses) midOs << ')';
+			
+			print(os, nestedType, move(midOs.str()));
+		}
+		
+		static void print(raw_ostream& os, const ArrayExpressionType& arrayTy, string middle)
+		{
+			raw_string_ostream(middle) << '[' << arrayTy.size() << ']';
+			print(os, arrayTy.getNestedType(), move(middle));
+		}
+		
+		static void print(raw_ostream& os, const StructExpressionType& structTy, string middle)
+		{
+			os << "struct {";
+			if (structTy.size() > 0)
+			{
+				os << ' ';
+				for (auto iter = structTy.begin(); iter != structTy.end(); ++iter)
+				{
+					print(os, iter->type, iter->name);
+					os << "; ";
+				}
+			}
+			os << "} " << move(middle);
+		}
+		
+		static void print(raw_ostream& os, const FunctionExpressionType& funcTy, string middle)
+		{
+			string result;
+			raw_string_ostream rs(result);
+			rs << middle << '(';
+			
+			auto iter = funcTy.begin();
+			if (iter != funcTy.end())
+			{
+				print(rs, iter->type, iter->name);
+				for (++iter; iter != funcTy.end(); ++iter)
+				{
+					rs << ", ";
+					print(rs, iter->type, iter->name);
+				}
+			}
+			
+			rs << ')';
+			print(os, funcTy.getReturnType(), move(rs.str()));
+		}
+		
+	public:
+		static void declare(raw_ostream& os, const ExpressionType& type, const string& identifier)
+		{
+			print(os, type, identifier);
+		}
+		
+		static void print(raw_ostream& os, const ExpressionType& type, string middle = "")
+		{
+			switch (type.getType())
+			{
+				case ExpressionType::Void:
+					return print(os, cast<VoidExpressionType>(type), move(middle));
+				case ExpressionType::Integer:
+					return print(os, cast<IntegerExpressionType>(type), move(middle));
+				case ExpressionType::Pointer:
+					return print(os, cast<PointerExpressionType>(type), move(middle));
+				case ExpressionType::Array:
+					return print(os, cast<ArrayExpressionType>(type), move(middle));
+				case ExpressionType::Structure:
+					return print(os, cast<StructExpressionType>(type), move(middle));
+				case ExpressionType::Function:
+					return print(os, cast<FunctionExpressionType>(type), move(middle));
+				default:
+					llvm_unreachable("unhandled expression type");
+			}
+		}
+	};
+	
+	template<typename T>
+	struct ScopedPush
+	{
+		list<T>* collection;
+		
+		template<typename... Args>
+		ScopedPush(list<T>& collection, Args&&... args)
+		: collection(&collection)
+		{
+			this->collection->emplace_back(forward<Args>(args)...);
+		}
+		
+		ScopedPush(ScopedPush&& that)
+		: collection(that.collection)
+		{
+			that.collection = nullptr;
+		}
+		
+		~ScopedPush()
+		{
+			if (collection != nullptr)
+			{
+				collection->pop_back();
+			}
+		}
+	};
+	
+	template<typename T, typename... Args>
+	ScopedPush<T> scopePush(list<T>& collection, Args&&... args)
+	{
+		return ScopedPush<T>(collection, forward<Args>(args)...);
+	}
+	
 	string operatorName[] = {
 		[UnaryOperatorExpression::Increment] = "++",
 		[UnaryOperatorExpression::Decrement] = "--",
 		[UnaryOperatorExpression::AddressOf] = "&",
 		[UnaryOperatorExpression::Dereference] = "*",
 		[UnaryOperatorExpression::LogicalNegate] = "!",
+		[NAryOperatorExpression::Assign] = "=",
 		[NAryOperatorExpression::Multiply] = "*",
 		[NAryOperatorExpression::Divide] = "/",
 		[NAryOperatorExpression::Modulus] = "%",
@@ -59,11 +213,13 @@ namespace
 		[NAryOperatorExpression::BitwiseOr] = "|",
 		[NAryOperatorExpression::ShortCircuitAnd] = "&&",
 		[NAryOperatorExpression::ShortCircuitOr] = "||",
-		[NAryOperatorExpression::MemberAccess] = ".",
-		[NAryOperatorExpression::PointerAccess] = "->",
+		[MemberAccessExpression::MemberAccess] = ".",
+		[MemberAccessExpression::PointerAccess] = "->",
 	};
 	
 	unsigned operatorPrecedence[] = {
+		[MemberAccessExpression::MemberAccess] = 1,
+		[MemberAccessExpression::PointerAccess] = 1,
 		[UnaryOperatorExpression::Increment] = 1,
 		[UnaryOperatorExpression::Decrement] = 1,
 		[UnaryOperatorExpression::AddressOf] = 2,
@@ -87,8 +243,7 @@ namespace
 		[NAryOperatorExpression::BitwiseOr] = 10,
 		[NAryOperatorExpression::ShortCircuitAnd] = 11,
 		[NAryOperatorExpression::ShortCircuitOr] = 12,
-		[NAryOperatorExpression::MemberAccess] = 1,
-		[NAryOperatorExpression::PointerAccess] = 1,
+		[NAryOperatorExpression::Assign] = 13,
 	};
 	
 	constexpr unsigned subscriptPrecedence = 1;
@@ -97,18 +252,22 @@ namespace
 	constexpr unsigned ternaryPrecedence = 13;
 	const string badOperator = "<bad>";
 	
-	static_assert(countof(operatorName) == NAryOperatorExpression::Max, "Incorrect number of operator name entries");
-	static_assert(countof(operatorPrecedence) == NAryOperatorExpression::Max, "Incorrect number of operator precedence entries");
+	static_assert(countof(operatorName) == MemberAccessExpression::Max, "Incorrect number of operator name entries");
+	static_assert(countof(operatorPrecedence) == MemberAccessExpression::Max, "Incorrect number of operator precedence entries");
 	
-	inline bool needsParentheses(unsigned thisPrecedence, Expression* expression)
+	bool needsParentheses(unsigned thisPrecedence, const Expression& expression)
 	{
-		if (auto asNAry = dyn_cast<NAryOperatorExpression>(expression))
+		if (auto asNAry = dyn_cast<NAryOperatorExpression>(&expression))
 		{
-			return operatorPrecedence[asNAry->type] > thisPrecedence;
+			return operatorPrecedence[asNAry->getType()] > thisPrecedence;
 		}
-		else if (auto asUnary = dyn_cast<UnaryOperatorExpression>(expression))
+		else if (auto asUnary = dyn_cast<UnaryOperatorExpression>(&expression))
 		{
-			return operatorPrecedence[asUnary->type] > thisPrecedence;
+			return operatorPrecedence[asUnary->getType()] > thisPrecedence;
+		}
+		else if (auto memberAccess = dyn_cast<MemberAccessExpression>(&expression))
+		{
+			return operatorPrecedence[memberAccess->getAccessType()] > thisPrecedence;
 		}
 		else if (isa<CastExpression>(expression))
 		{
@@ -121,338 +280,518 @@ namespace
 		return false;
 	}
 	
+	bool shouldReduceIntoToken(const Expression& expression)
+	{
+		if (isa<AssignableExpression>(expression))
+		{
+			return true;
+		}
+		else if (isa<UnaryOperatorExpression>(expression))
+		{
+			return false;
+		}
+		else if (auto memberAcces = dyn_cast<MemberAccessExpression>(&expression))
+		{
+			return shouldReduceIntoToken(*memberAcces->getBaseExpression());
+		}
+		
+		if (!expression.uses_many())
+		{
+			return false;
+		}
+		
+		return true;
+	}
+	
 	constexpr char nl = '\n';
 }
 
-#pragma mark - Expressions
-void ExpressionPrintVisitor::printWithParentheses(unsigned int precedence, Expression *expression)
+struct StatementPrintVisitor::PrintInfo
 {
-	bool parenthesize = needsParentheses(precedence, expression);
-	if (parenthesize) os << '(';
-	expression->visit(*this);
-	if (parenthesize) os << ')';
-}
-
-void ExpressionPrintVisitor::visitUnary(UnaryOperatorExpression* unary)
-{
-	unsigned precedence = numeric_limits<unsigned>::max();
-	if (unary->type > UnaryOperatorExpression::Min && unary->type < UnaryOperatorExpression::Max)
-	{
-		os << operatorName[unary->type];
-		precedence = operatorPrecedence[unary->type];
-	}
-	else
-	{
-		os << badOperator;
-	}
-	printWithParentheses(precedence, unary->operand);
-}
-
-void ExpressionPrintVisitor::visitNAry(NAryOperatorExpression* nary)
-{
-	assert(nary->operands.size() > 0);
+	llvm::raw_ostream* targetScope;
+	const ExpressionUser* user;
+	std::string buffer;
+	llvm::raw_string_ostream thisScope;
+	unsigned indentCount;
 	
-	const std::string* displayName = &badOperator;
-	unsigned precedence = numeric_limits<unsigned>::max();
-	if (nary->type >= NAryOperatorExpression::Min && nary->type < NAryOperatorExpression::Max)
+	PrintInfo(const ExpressionUser* user, llvm::raw_ostream& os, unsigned indent)
+	: targetScope(&os), user(user), thisScope(buffer), indentCount(indent)
 	{
-		displayName = &operatorName[nary->type];
-		precedence = operatorPrecedence[nary->type];
 	}
 	
-	auto iter = nary->operands.begin();
-	printWithParentheses(precedence, *iter);
-	++iter;
-	
-	bool surroundWithSpaces =
-		nary->type != NAryOperatorExpression::MemberAccess
-		&& nary->type != NAryOperatorExpression::PointerAccess;
-	
-	for (; iter != nary->operands.end(); ++iter)
+	~PrintInfo()
 	{
-		if (surroundWithSpaces)
-		{
-			os << ' ';
-		}
-		os << *displayName;
-		if (surroundWithSpaces)
-		{
-			os << ' ';
-		}
-		
-		printWithParentheses(precedence, *iter);
-	}
-}
-
-void ExpressionPrintVisitor::visitTernary(TernaryExpression* ternary)
-{
-	printWithParentheses(ternaryPrecedence, ternary->condition);
-	os << " ? ";
-	printWithParentheses(ternaryPrecedence, ternary->ifTrue);
-	os << " : ";
-	printWithParentheses(ternaryPrecedence, ternary->ifFalse);
-}
-
-void ExpressionPrintVisitor::visitNumeric(NumericExpression* numeric)
-{
-	os << numeric->si64;
-}
-
-void ExpressionPrintVisitor::visitToken(TokenExpression* token)
-{
-	os << token->token;
-}
-
-void ExpressionPrintVisitor::visitCall(CallExpression* call)
-{
-	const PooledDeque<NOT_NULL(const char)>* parameterNames = nullptr;
-	if (AssemblyExpression* callee = dyn_cast<AssemblyExpression>(call->callee))
-	{
-		parameterNames = &callee->parameterNames;
+		*targetScope << thisScope.str();
 	}
 	
-	printWithParentheses(callPrecedence, call->callee);
-	
-	size_t paramIndex = 0;
-	os << '(';
-	auto iter = call->parameters.begin();
-	auto end = call->parameters.end();
-	if (iter != end)
-	{
-		if (parameterNames != nullptr)
-		{
-			os << (*parameterNames)[paramIndex] << '=';
-			paramIndex++;
-		}
-		
-		(*iter)->visit(*this);
-		for (++iter; iter != end; ++iter)
-		{
-			os << ", ";
-			if (parameterNames != nullptr)
-			{
-				os << (*parameterNames)[paramIndex] << '=';
-				paramIndex++;
-			}
-			(*iter)->visit(*this);
-		}
-	}
-	os << ')';
-}
+	std::string indent() const;
+};
 
-void ExpressionPrintVisitor::visitCast(CastExpression* cast)
+raw_string_ostream& StatementPrintVisitor::os()
 {
-	os << '(';
-	// Maybe we'll want to get rid of this once we have better type inference.
-	if (cast->sign == CastExpression::SignExtend)
-	{
-		os << "__sext ";
-	}
-	else if (cast->sign == CastExpression::ZeroExtend)
-	{
-		os << "__zext ";
-	}
-	cast->type->visit(*this);
-	os << ')';
-	printWithParentheses(castPrecedence, cast->casted);
+	 return printInfo.back().thisScope;
 }
 
-void ExpressionPrintVisitor::visitAggregate(AggregateExpression* cast)
-{
-	os << '{';
-	size_t count = cast->values.size();
-	if (count > 0)
-	{
-		cast->values[0]->visit(*this);
-		for (size_t i = 1; i < count; ++i)
-		{
-			os << ", ";
-			cast->values[i]->visit(*this);
-		}
-	}
-	os << '}';
-}
-
-void ExpressionPrintVisitor::visitSubscript(SubscriptExpression *subscript)
-{
-	printWithParentheses(subscriptPrecedence, subscript->left);
-	os << '[';
-	subscript->index->visit(*this);
-	os << ']';
-}
-
-void ExpressionPrintVisitor::visitAssembly(AssemblyExpression *assembly)
-{
-	os << "(__asm \"" << assembly->assembly << "\")";
-}
-
-#pragma mark - Statements
-std::string StatementPrintVisitor::indent() const
+string StatementPrintVisitor::PrintInfo::indent() const
 {
 	return string(indentCount, '\t');
 }
 
-void StatementPrintVisitor::printWithIndent(Statement *statement)
+unsigned StatementPrintVisitor::indentCount() const
 {
-	unsigned amount = isa<SequenceStatement>(statement) ? 0 : 1;
-	indentCount += amount;
-	statement->visit(*this);
-	indentCount -= amount;
+	return printInfo.back().indentCount;
 }
 
-void StatementPrintVisitor::visitIfElse(IfElseStatement *ifElse, const std::string &firstLineIndent)
+const string* StatementPrintVisitor::hasIdentifier(const Expression &expression)
 {
-	os << firstLineIndent << "if (";
-	ifElse->condition->visit(expressionPrinter);
-	os << ")\n";
-	
-	printWithIndent(ifElse->ifBody);
-	if (auto elseBody = ifElse->elseBody)
+	auto iter = tokens.find(&expression);
+	return iter == tokens.end() ? nullptr : &iter->second;
+}
+
+bool StatementPrintVisitor::identifyIfNecessary(const Expression &expression)
+{
+	if (!tokenize || noTokens.count(&expression) != 0)
 	{
-		os << indent() << "else";
+		return false;
+	}
+	
+	if (!shouldReduceIntoToken(expression))
+	{
+		noTokens.insert(&expression);
+		return false;
+	}
+	
+	string& value = printInfo.back().thisScope.str();
+	string& identifier = tokens[&expression];
+	assert(identifier.empty());
+	
+	if (auto assignable = dyn_cast<AssignableExpression>(&expression))
+	{
+		raw_string_ostream(identifier) << assignable->prefix << tokens.size();
+	}
+	else
+	{
+		raw_string_ostream(identifier) << "anon" << tokens.size();
+	}
+	
+	// Find best place to declare variable
+	auto commonAncestor = expression.ancestorOfAllUses();
+	assert(commonAncestor != nullptr);
+	
+	if (isa<IfElseStatement>(commonAncestor))
+	{
+		// You can't put a declaration in an if-else statement that would reach its two branches.
+		commonAncestor = commonAncestor->getParent();
+	}
+	
+	auto firstStatement = find_if(printInfo.rbegin(), printInfo.rend(), [&](PrintInfo& info)
+	{
+		return info.user != nullptr && isa<Statement>(info.user);
+	});
+	
+	auto commonAncestorIter = find_if(firstStatement, printInfo.rend(), [&](PrintInfo& info)
+	{
+		return info.user == commonAncestor;
+	});
+	
+	auto& decl = *commonAncestorIter->targetScope;
+	decl << commonAncestorIter->indent();
+	CTypePrinter::declare(decl, expression.getExpressionType(ctx), identifier);
+	if (value.empty())
+	{
+		decl << ";\n";
+	}
+	else
+	{
+		decl << " = " << value << ";\n";
+	}
+	value = identifier;
+	return true;
+}
+
+void StatementPrintVisitor::printWithParentheses(unsigned int precedence, const Expression& expression)
+{
+	auto pushed = scopePush(printInfo, nullptr, os(), indentCount());
+	visit(expression);
+	
+	if (needsParentheses(precedence, expression) && tokens.find(&expression) == tokens.end())
+	{
+		string expression = printInfo.back().thisScope.str();
+		printInfo.back().buffer.clear();
+		os() << '(' << expression << ')';
+	}
+}
+
+StatementPrintVisitor::StatementPrintVisitor(AstContext& ctx, llvm::raw_ostream& os, unsigned initialIndent, bool tokenize)
+: ctx(ctx), tokenize(tokenize)
+{
+	printInfo.emplace_back(nullptr, os, initialIndent);
+}
+
+StatementPrintVisitor::~StatementPrintVisitor()
+{
+}
+
+#pragma mark - Expressions
+void StatementPrintVisitor::visitUnaryOperator(const UnaryOperatorExpression& unary)
+{
+	if (auto id = hasIdentifier(unary))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &unary, os(), indentCount());
+	
+	unsigned precedence = numeric_limits<unsigned>::max();
+	auto type = unary.getType();
+	if (type > UnaryOperatorExpression::Min && type < UnaryOperatorExpression::Max)
+	{
+		os() << operatorName[type];
+		precedence = operatorPrecedence[type];
+	}
+	else
+	{
+		os() << badOperator;
+	}
+	printWithParentheses(precedence, *unary.getOperand());
+	identifyIfNecessary(unary);
+}
+
+void StatementPrintVisitor::visitNAryOperator(const NAryOperatorExpression& nary)
+{
+	assert(nary.operands_size() > 0);
+	if (auto id = hasIdentifier(nary))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &nary, os(), indentCount());
+	
+	const string* displayName = &badOperator;
+	unsigned precedence = numeric_limits<unsigned>::max();
+	auto type = nary.getType();
+	if (type >= NAryOperatorExpression::Min && type < NAryOperatorExpression::Max)
+	{
+		displayName = &operatorName[type];
+		precedence = operatorPrecedence[type];
+	}
+	
+	auto iter = nary.operands_begin();
+	printWithParentheses(precedence, *iter->getUse());
+	++iter;
+	
+	for (; iter != nary.operands_end(); ++iter)
+	{
+		os() << ' ' << *displayName << ' ';
+		printWithParentheses(precedence, *iter->getUse());
+	}
+	identifyIfNecessary(nary);
+}
+
+void StatementPrintVisitor::visitMemberAccess(const MemberAccessExpression &assignable)
+{
+	// member accesses are never reduced into tokens, but call it anyway for uniformity.
+	if (auto id = hasIdentifier(assignable))
+	{
+		assert(false);
+		os() << *id;
+		return;
+	}
+	
+	auto pushed = scopePush(printInfo, &assignable, os(), indentCount());
+	printWithParentheses(operatorPrecedence[assignable.getAccessType()], *assignable.getBaseExpression());
+	os() << operatorName[assignable.getAccessType()] << assignable.getFieldName();
+}
+
+void StatementPrintVisitor::visitTernary(const TernaryExpression& ternary)
+{
+	if (auto id = hasIdentifier(ternary))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &ternary, os(), indentCount());
+	
+	printWithParentheses(ternaryPrecedence, *ternary.getCondition());
+	os() << " ? ";
+	printWithParentheses(ternaryPrecedence, *ternary.getTrueValue());
+	os() << " : ";
+	printWithParentheses(ternaryPrecedence, *ternary.getFalseValue());
+	identifyIfNecessary(ternary);
+}
+
+void StatementPrintVisitor::visitNumeric(const NumericExpression& numeric)
+{
+	os() << numeric.si64;
+}
+
+void StatementPrintVisitor::visitToken(const TokenExpression& token)
+{
+	os() << token.token;
+}
+
+void StatementPrintVisitor::visitCall(const CallExpression& call)
+{
+	if (auto id = hasIdentifier(call))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &call, os(), indentCount());
+	
+	auto callTarget = call.getCallee();
+	printWithParentheses(callPrecedence, *callTarget);
+	
+	const auto& funcPointerType = cast<PointerExpressionType>(callTarget->getExpressionType(ctx));
+	const auto& funcType = cast<FunctionExpressionType>(funcPointerType.getNestedType());
+	size_t paramIndex = 0;
+	os() << '(';
+	auto iter = call.params_begin();
+	auto end = call.params_end();
+	if (iter != end)
+	{
+		const string& paramName = funcType[paramIndex].name;
+		if (paramName != "")
+		{
+			os() << paramName << '=';
+			paramIndex++;
+		}
+		
+		visit(*iter->getUse());
+		for (++iter; iter != end; ++iter)
+		{
+			os() << ", ";
+			const string& paramName = funcType[paramIndex].name;
+			if (paramName != "")
+			{
+				os() << paramName << '=';
+				paramIndex++;
+			}
+			visit(*iter->getUse());
+		}
+	}
+	os() << ')';
+	identifyIfNecessary(call);
+}
+
+void StatementPrintVisitor::visitCast(const CastExpression& cast)
+{
+	if (auto id = hasIdentifier(cast))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &cast, os(), indentCount());
+	
+	os() << '(';
+	
+	// XXX: are __sext and __zext annotations relevant? they only mirror whether
+	// there's a "u" or not in front of the integer type.
+	if (auto intType = dyn_cast<IntegerExpressionType>(&cast.getExpressionType(ctx)))
+	if (auto innerType = dyn_cast<IntegerExpressionType>(&cast.getCastValue()->getExpressionType(ctx)))
+	if (innerType->getBits() < intType->getBits())
+	{
+		os() << (intType->isSigned() ? "__sext " : "__zext ");
+	}
+	
+	CTypePrinter::print(os(), cast.getExpressionType(ctx));
+	os() << ')';
+	printWithParentheses(castPrecedence, *cast.getCastValue());
+	identifyIfNecessary(cast);
+}
+
+void StatementPrintVisitor::visitAggregate(const AggregateExpression& aggregate)
+{
+	if (auto id = hasIdentifier(aggregate))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &aggregate, os(), indentCount());
+	
+	os() << '{';
+	size_t count = aggregate.operands_size();
+	if (count > 0)
+	{
+		auto iter = aggregate.operands_begin();
+		visit(*iter->getUse());
+		for (++iter; iter != aggregate.operands_end(); ++iter)
+		{
+			os() << ", ";
+			visit(*iter->getUse());
+		}
+	}
+	os() << '}';
+	identifyIfNecessary(aggregate);
+}
+
+void StatementPrintVisitor::visitSubscript(const SubscriptExpression& subscript)
+{
+	if (auto id = hasIdentifier(subscript))
+	{
+		os() << *id;
+		return;
+	}
+	auto pushed = scopePush(printInfo, &subscript, os(), indentCount());
+	
+	printWithParentheses(subscriptPrecedence, *subscript.getPointer());
+	os() << '[';
+	visit(*subscript.getIndex());
+	os() << ']';
+	identifyIfNecessary(subscript);
+}
+
+void StatementPrintVisitor::visitAssembly(const AssemblyExpression& assembly)
+{
+	os() << "(__asm \"" << assembly.assembly << "\")";
+}
+
+void StatementPrintVisitor::visitAssignable(const AssignableExpression &assignable)
+{
+	if (auto id = hasIdentifier(assignable))
+	{
+		os() << *id;
+		return;
+	}
+	
+	auto pushed = scopePush(printInfo, &assignable, os(), indentCount());
+	if (tokenize)
+	{
+		identifyIfNecessary(assignable);
+	}
+	else
+	{
+		os() << "«" << assignable.prefix << ":" << &assignable << "»";
+	}
+}
+
+#pragma mark - Statements
+string StatementPrintVisitor::indent() const
+{
+	return printInfo.back().indent();
+}
+
+void StatementPrintVisitor::print(AstContext& ctx, llvm::raw_ostream &os, const ExpressionUser& user, unsigned initialIndent, bool tokenize)
+{
+	StatementPrintVisitor printer(ctx, os, initialIndent, tokenize);
+	printer.visit(user);
+}
+
+void StatementPrintVisitor::declare(raw_ostream& os, const ExpressionType &type, const string &variable)
+{
+	CTypePrinter::declare(os, type, variable);
+}
+
+void StatementPrintVisitor::visitIfElse(const IfElseStatement& ifElse, const string &firstLineIndent)
+{
+	auto pushed = scopePush(printInfo, &ifElse, os(), indentCount());
+	
+	os() << firstLineIndent << "if (";
+	visit(*ifElse.getCondition());
+	os() << ")\n";
+	
+	os() << indent() << "{\n";
+	{
+		auto pushed = scopePush(printInfo, &ifElse, os(), indentCount() + 1);
+		visit(*ifElse.getIfBody());
+	}
+	os() << indent() << "}\n";
+	
+	if (auto elseBody = ifElse.getElseBody())
+	{
+		os() << indent() << "else";
 		if (auto otherCase = dyn_cast<IfElseStatement>(elseBody))
 		{
-			visitIfElse(otherCase, " ");
+			visitIfElse(*otherCase, " ");
 		}
 		else
 		{
-			os << nl;
-			printWithIndent(elseBody);
+			os() << nl << indent() << "{\n";
+			{
+				auto pushed = scopePush(printInfo, &ifElse, os(), indentCount() + 1);
+				visit(*elseBody);
+			}
+			os() << indent() << "}\n";
 		}
 	}
 }
 
-void StatementPrintVisitor::visitSequence(SequenceStatement* sequence)
+void StatementPrintVisitor::visitNoop(const NoopStatement &noop)
 {
-	os << indent() << '{' << nl;
-	++indentCount;
-	StatementVisitor::visitSequence(sequence);
-	--indentCount;
-	os << indent() << '}' << nl;
 }
 
-void StatementPrintVisitor::visitIfElse(IfElseStatement* ifElse)
+void StatementPrintVisitor::visitSequence(const SequenceStatement& sequence)
+{
+	auto pushed = scopePush(printInfo, &sequence, os(), indentCount());
+	for (Statement* child : sequence)
+	{
+		visit(*child);
+	}
+}
+
+void StatementPrintVisitor::visitIfElse(const IfElseStatement& ifElse)
 {
 	visitIfElse(ifElse, indent());
 }
 
-void StatementPrintVisitor::visitLoop(LoopStatement* loop)
+void StatementPrintVisitor::visitLoop(const LoopStatement& loop)
 {
-	if (loop->position == LoopStatement::PreTested)
+	auto pushed = scopePush(printInfo, &loop, os(), indentCount());
+	
+	if (loop.getPosition() == LoopStatement::PreTested)
 	{
-		os << indent() << "while (";
-		loop->condition->visit(expressionPrinter);
-		os << ")\n";
-		printWithIndent(loop->loopBody);
+		os() << indent() << "while (";
+		visit(*loop.getCondition());
+		os() << ")\n";
+		
+		os() << indent() << "{\n";
+		{
+			auto pushed = scopePush(printInfo, &loop, os(), indentCount() + 1);
+			visit(*loop.getLoopBody());
+		}
+		os() << indent() << "}\n";
 	}
 	else
 	{
-		assert(loop->position == LoopStatement::PostTested);
-		os << indent() << "do" << nl;
-		printWithIndent(loop->loopBody);
-		os << indent() << "while (";
-		loop->condition->visit(expressionPrinter);
-		os << ");\n";
+		assert(loop.getPosition() == LoopStatement::PostTested);
+		
+		os() << indent() << "do" << nl;
+		os() << indent() << "{\n";
+		{
+			auto pushed = scopePush(printInfo, &loop, os(), indentCount() + 1);
+			visit(*loop.getLoopBody());
+		}
+		os() << indent() << "} while (";
+		visit(*loop.getCondition());
+		os() << ");\n";
 	}
 }
 
-void StatementPrintVisitor::visitKeyword(KeywordStatement* keyword)
+void StatementPrintVisitor::visitKeyword(const KeywordStatement& keyword)
 {
-	os << indent() << keyword->name;
-	if (auto operand = keyword->operand)
+	auto pushed = scopePush(printInfo, &keyword, os(), indentCount());
+	
+	os() << indent() << keyword.name;
+	if (auto operand = keyword.getOperand())
 	{
-		os << ' ';
-		operand->visit(expressionPrinter);
+		os() << ' ';
+		visit(*operand);
 	}
-	os << ";\n";
+	os() << ";\n";
 }
 
-void StatementPrintVisitor::visitExpression(ExpressionStatement* expression)
+void StatementPrintVisitor::visitExpr(const ExpressionStatement& expression)
 {
-	os << indent();
-	expression->expression->visit(expressionPrinter);
-	os << ";\n";
-}
-
-void StatementPrintVisitor::visitDeclaration(DeclarationStatement* declaration)
-{
-	os << indent();
-	declaration->type->visit(expressionPrinter);
-	os << ' ';
-	declaration->name->visit(expressionPrinter);
-	os << ';';
-	if (auto comment = declaration->comment)
+	const Expression& expr = *expression.getExpression();
+	auto pushed = scopePush(printInfo, &expression, os(), indentCount());
+	
+	os() << indent();
+	visit(expr);
+	os() << ";\n";
+	
+	// Don't print anything if the expression is replaced with a single token.
+	if (tokens.find(&expr) != tokens.end())
 	{
-		os << " // " << comment;
+		os().str().clear();
 	}
-	os << nl;
-}
-
-void StatementPrintVisitor::visitAssignment(AssignmentStatement* assignment)
-{
-	os << indent();
-	assignment->left->visit(expressionPrinter);
-	os << " = ";
-	assignment->right->visit(expressionPrinter);
-	os << ";\n";
-}
-
-#pragma mark - Short Statements
-
-void StatementShortPrintVisitor::visitSequence(SequenceStatement* sequence)
-{
-	os << "{ ... }";
-}
-
-void StatementShortPrintVisitor::visitIfElse(IfElseStatement *ifElse)
-{
-	os << "if (";
-	ifElse->condition->visit(expressionPrinter);
-	os << ')';
-}
-
-void StatementShortPrintVisitor::visitLoop(LoopStatement* loop)
-{
-	if (loop->position == LoopStatement::PreTested)
-	{
-		os << "while (";
-		loop->condition->visit(expressionPrinter);
-		os << ')';
-	}
-	else
-	{
-		assert(loop->position == LoopStatement::PostTested);
-		os << "do while (";
-		loop->condition->visit(expressionPrinter);
-		os << ')';
-	}
-}
-
-void StatementShortPrintVisitor::visitKeyword(KeywordStatement* keyword)
-{
-	os << keyword->name;
-	if (auto operand = keyword->operand)
-	{
-		os << ' ';
-		operand->visit(expressionPrinter);
-	}
-}
-
-void StatementShortPrintVisitor::visitExpression(ExpressionStatement* expression)
-{
-	expression->expression->visit(expressionPrinter);
-}
-
-void StatementShortPrintVisitor::visitDeclaration(DeclarationStatement* declaration)
-{
-	declaration->type->visit(expressionPrinter);
-	os << ' ';
-	declaration->name->visit(expressionPrinter);
-}
-
-void StatementShortPrintVisitor::visitAssignment(AssignmentStatement* assignment)
-{
-	assignment->left->visit(expressionPrinter);
-	os << " = ";
-	assignment->right->visit(expressionPrinter);
 }

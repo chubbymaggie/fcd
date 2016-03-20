@@ -26,25 +26,32 @@
 #include "params_registry.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
+#include <llvm/Analysis/AliasAnalysis.h>
+#include <llvm/Analysis/BasicAliasAnalysis.h>
 #include <llvm/Analysis/Passes.h>
-#include <llvm/IR/Instructions.h>
+#include <llvm/Analysis/ScopedNoAliasAA.h>
+#include <llvm/Analysis/TypeBasedAliasAnalysis.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Path.h>
+#include <llvm/Support/Process.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/Scalar.h>
 SILENCE_LLVM_WARNINGS_END()
 
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <unordered_map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -63,9 +70,11 @@ namespace
 	cl::opt<string> inputFile(cl::Positional, cl::desc("<input program>"), cl::Required, whitelist());
 	cl::list<unsigned long long> additionalEntryPoints("other-entry", cl::desc("Add entry point from virtual address (can be used multiple times)"), cl::CommaSeparated, whitelist());
 	cl::list<bool> partialDisassembly("partial", cl::desc("Only decompile functions specified with --other-entry"), whitelist());
-	cl::list<string> additionalPasses("opt", cl::desc("Insert LLVM optimization pass; a pass name ending in .py is interpreted as a Python script"), whitelist());
-	cl::opt<bool> inputIsModule("module-in", cl::desc("Input file is a LLVM module"), whitelist());
-	cl::opt<bool> outputIsModule("module-out", cl::desc("Output LLVM module"), whitelist());
+	cl::list<bool> inputIsModule("module-in", cl::desc("Input file is a LLVM module"), whitelist());
+	cl::list<bool> outputIsModule("module-out", cl::desc("Output LLVM module"), whitelist());
+	
+	cl::list<string> additionalPasses("opt", cl::desc("Insert LLVM optimization pass; a pass name ending in .py is interpreted as a Python script. Requires default pass pipeline."), whitelist());
+	cl::opt<string> customPassPipeline("opt-pipeline", cl::desc("Customize pass pipeline. Empty string lets you order passes through $EDITOR; otherwise, must be a whitespace-separated list of passes."), cl::init("default"), whitelist());
 	
 	cl::alias additionalEntryPointsAlias("e", cl::desc("Alias for --other-entry"), cl::aliasopt(additionalEntryPoints), whitelist());
 	cl::alias partialDisassemblyAlias("p", cl::desc("Alias for --partial"), cl::aliasopt(partialDisassembly), whitelist());
@@ -73,19 +82,35 @@ namespace
 	cl::alias inputIsModuleAlias("m", cl::desc("Alias for --module-in"), cl::aliasopt(inputIsModule), whitelist());
 	cl::alias outputIsModuleAlias("n", cl::desc("Alias for --module-out"), cl::aliasopt(outputIsModule), whitelist());
 	
-	inline int partialOptCount()
+	template<int (*)()> // templated to ensure multiple instatiation of the static variables
+	inline int optCount(const cl::list<bool>& list)
 	{
 		static int count = 0;
 		static bool counted = false;
 		if (!counted)
 		{
-			for (bool opt : partialDisassembly)
+			for (bool opt : list)
 			{
 				count += opt ? 1 : -1;
 			}
 			counted = true;
 		}
 		return count;
+	}
+	
+	inline int partialOptCount()
+	{
+		return optCount<partialOptCount>(partialDisassembly);
+	}
+	
+	inline int moduleInCount()
+	{
+		return optCount<moduleInCount>(inputIsModule);
+	}
+	
+	inline int moduleOutCount()
+	{
+		return optCount<moduleOutCount>(outputIsModule);
 	}
 	
 	void pruneOptionList(StringMap<cl::Option*>& list)
@@ -157,16 +182,176 @@ namespace
 	
 		LLVMContext& llvm;
 		PythonContext python;
-		vector<Pass*> additionalPasses;
+		vector<Pass*> optimizeAndTransformPasses;
+		
+		static void aliasAnalysisHooks(Pass& pass, Function& fn, AAResults& aar)
+		{
+			if (auto prgmem = pass.getAnalysisIfAvailable<ProgramMemoryAAWrapperPass>())
+			{
+				aar.addAAResult(prgmem->getResult());
+			}
+			if (auto params = pass.getAnalysisIfAvailable<ParameterRegistry>())
+			{
+				aar.addAAResult(params->getAAResult());
+			}
+		}
 	
 		static legacy::PassManager createBasePassManager()
 		{
 			legacy::PassManager pm;
-			pm.add(createTypeBasedAliasAnalysisPass());
-			pm.add(createScopedNoAliasAAPass());
-			pm.add(createBasicAliasAnalysisPass());
+			pm.add(createTypeBasedAAWrapperPass());
+			pm.add(createScopedNoAliasAAWrapperPass());
+			pm.add(createBasicAAWrapperPass());
 			pm.add(createProgramMemoryAliasAnalysis());
 			return pm;
+		}
+		
+		vector<Pass*> createPassesFromList(const vector<string>& passNames)
+		{
+			vector<Pass*> result;
+			PassRegistry* pr = PassRegistry::getPassRegistry();
+			for (string passName : passNames)
+			{
+				auto begin = passName.begin();
+				while (begin != passName.end())
+				{
+					if (isspace(*begin))
+					{
+						++begin;
+					}
+					else
+					{
+						break;
+					}
+				}
+				passName.erase(passName.begin(), begin);
+				
+				auto rbegin = passName.rbegin();
+				while (rbegin != passName.rend())
+				{
+					if (isspace(*rbegin))
+					{
+						++rbegin;
+					}
+					else
+					{
+						break;
+					}
+				}
+				passName.erase(rbegin.base(), passName.end());
+				
+				if (passName.size() > 0 && passName[0] != '#')
+				{
+					auto ext = sys::path::extension(passName);
+					if (ext == ".py" || ext == ".pyc" || ext == ".pyo")
+					{
+						if (auto passOrError = python.createPass(passName))
+						{
+							result.push_back(passOrError.get());
+						}
+						else
+						{
+							cerr << getProgramName() << ": couldn't load " << passName << ": " << errorOf(passOrError) << endl;
+							return vector<Pass*>();
+						}
+					}
+					else if (const PassInfo* pi = pr->getPassInfo(passName))
+					{
+						result.push_back(pi->createPass());
+					}
+					else
+					{
+						cerr << getProgramName() << ": couldn't identify pass " << passName << endl;
+						return vector<Pass*>();
+					}
+				}
+			}
+			
+			if (result.size() == 0)
+			{
+				errs() << getProgramName() << ": empty pass list\n";
+			}
+			return result;
+		}
+	
+		vector<Pass*> interactivelyEditPassPipeline(const string& editor, const vector<string>& basePasses)
+		{
+			int fd;
+			SmallVector<char, 100> path;
+			if (auto errorCode = sys::fs::createTemporaryFile("fcd-pass-pipeline", "txt", fd, path))
+			{
+				errs() << getProgramName() << ": can't open temporary file for editing: " << errorCode.message() << "\n";
+				return vector<Pass*>();
+			}
+			
+			raw_fd_ostream passListOs(fd, true);
+			passListOs << "# Enter the name of the LLVM or fcd passes that you want to run on the module.\n";
+			passListOs << "# Files starting with a # symbol are ignored.\n";
+			passListOs << "# Names ending with .py are assumed to be Python scripts implementing passes.\n";
+			for (const string& passName : basePasses)
+			{
+				passListOs << passName << '\n';
+			}
+			passListOs.flush();
+			
+			// shell escape temporary path
+			string escapedPath;
+			escapedPath.reserve(path.size());
+			for (char c : path)
+			{
+				if (c == '\'' || c == '\\')
+				{
+					escapedPath.push_back('\\');
+				}
+				escapedPath.push_back(c);
+			}
+			
+			string editCommand;
+			raw_string_ostream(editCommand) << editor << " '" << escapedPath << "'";
+			if (int errorCode = system(editCommand.c_str()))
+			{
+				errs() << getProgramName() << ": interactive pass pipeline: editor returned status code " << errorCode << '\n';
+				return vector<Pass*>();
+			}
+			
+			ifstream passListIs(path.data());
+			assert(static_cast<bool>(passListIs));
+			
+			string inputLine;
+			vector<string> lines;
+			while (getline(passListIs, inputLine))
+			{
+				lines.push_back(inputLine);
+				inputLine.clear();
+			}
+			if (inputLine.size() != 0)
+			{
+				lines.push_back(inputLine);
+			}
+			
+			return createPassesFromList(lines);
+		}
+		
+		vector<Pass*> readPassPipelineFromString(const string& argString)
+		{
+			stringstream ss(argString, ios::in);
+			vector<string> passes;
+			while (ss)
+			{
+				passes.emplace_back();
+				string& passName = passes.back();
+				ss >> passName;
+				if (passName.size() == 0 || passName[0] == '#')
+				{
+					passes.pop_back();
+				}
+			}
+			auto result = createPassesFromList(passes);
+			if (result.size() == 0)
+			{
+				errs() << getProgramName() << ": empty custom pass list\n";
+			}
+			return result;
 		}
 	
 	public:
@@ -249,8 +434,10 @@ namespace
 			// Perform early optimizations to make the module suitable for analysis
 			auto module = transl.take();
 			legacy::PassManager phaseOne = createBasePassManager();
-			phaseOne.add(createInstructionCombiningPass());
+			phaseOne.add(createExternalAAWrapperPass(&Main::aliasAnalysisHooks));
+			phaseOne.add(createDeadCodeEliminationPass());
 			phaseOne.add(createCFGSimplificationPass());
+			phaseOne.add(createInstructionCombiningPass());
 			phaseOne.add(createRegisterPointerPromotionPass());
 			phaseOne.add(createGVNPass());
 			phaseOne.add(createDeadStoreEliminationPass());
@@ -302,7 +489,7 @@ namespace
 			}
 		}
 
-		bool optimizeAndTransformModule(Module& module, raw_ostream& errorOutput, Executable* executable = nullptr)
+		bool preoptimizeModule(Module& module, raw_ostream& errorOutput, Executable* executable = nullptr)
 		{
 			// Do we still have instances of the unimplemented intrinsic? Bail out here if so.
 			size_t errorCount = 0;
@@ -326,12 +513,13 @@ namespace
 				return false;
 			}
 	
-			// Phase two: discover things, simplify other things
+			// Pre-optimize the module before running the customizable pipeline.
 			for (int i = 0; i < 2; i++)
 			{
 				auto phaseTwo = createBasePassManager();
 				phaseTwo.add(new ExecutableWrapper(executable));
 				phaseTwo.add(createParameterRegistryPass());
+				phaseTwo.add(createExternalAAWrapperPass(&Main::aliasAnalysisHooks));
 				phaseTwo.add(createConditionSimplificationPass());
 				phaseTwo.add(createGVNPass());
 				phaseTwo.add(createDeadStoreEliminationPass());
@@ -347,49 +535,21 @@ namespace
 				}
 #endif
 			}
-	
+			return true;
+		}
+		
+		bool optimizeAndTransformModule(Module& module, raw_ostream& errorOutput, Executable* executable = nullptr)
+		{
 			// Phase 3: make into functions with arguments, run codegen.
-			auto phaseThree = createBasePassManager();
-			phaseThree.add(new ExecutableWrapper(executable));
-			phaseThree.add(createParameterRegistryPass());
-			phaseThree.add(createGlobalDCEPass());
-			phaseThree.add(createFixIndirectsPass());
-			phaseThree.add(createArgumentRecoveryPass());
-			phaseThree.add(createModuleThinnerPass());
-			phaseThree.add(createSignExtPass());
-			phaseThree.add(createConditionSimplificationPass());
-	
-			// XXX: do something about this, I keep coming back to add passes to
-			// accommodate my custom passes
-			
-			// add any additional pass here
-			for (Pass* pass : additionalPasses)
+			auto passManager = createBasePassManager();
+			passManager.add(new ExecutableWrapper(executable));
+			passManager.add(createParameterRegistryPass());
+			passManager.add(createExternalAAWrapperPass(&Main::aliasAnalysisHooks));
+			for (Pass* pass : optimizeAndTransformPasses)
 			{
-				phaseThree.add(pass);
+				passManager.add(pass);
 			}
-			additionalPasses.clear();
-	
-			phaseThree.add(createInstructionCombiningPass());
-			phaseThree.add(createSROAPass());
-			phaseThree.add(createInstructionCombiningPass());
-			phaseThree.add(createGVNPass());
-			phaseThree.add(createCFGSimplificationPass());
-			phaseThree.add(createInstructionCombiningPass());
-			phaseThree.add(createGVNPass());
-			phaseThree.add(createIdentifyLocalsPass());
-			phaseThree.add(createDeadStoreEliminationPass());
-			phaseThree.add(createIPSCCPPass());
-			phaseThree.add(createCFGSimplificationPass());
-			phaseThree.add(createNoopCastEliminationPass());
-			phaseThree.add(createInstructionCombiningPass());
-			phaseThree.add(createMemorySSADeadLoadEliminationPass());
-			phaseThree.add(createDeadStoreEliminationPass());
-			phaseThree.add(createInstructionCombiningPass());
-			phaseThree.add(createSROAPass());
-			phaseThree.add(createInstructionCombiningPass());
-			phaseThree.add(createGlobalDCEPass());
-			phaseThree.add(createCFGSimplificationPass());
-			phaseThree.run(module);
+			passManager.run(module);
 	
 #ifdef DEBUG
 			if (verifyModule(module, &errorOutput))
@@ -407,12 +567,9 @@ namespace
 			// UnwrapReturns happens after value propagation because value propagation doesn't know that calls
 			// are generally not safe to reorder.
 			AstBackEnd* backend = createAstBackEnd();
-			backend->addPass(new AstBranchCombine);
-			backend->addPass(new AstFlatten);
-			backend->addPass(new AstPropagateValues);
-			backend->addPass(new AstSimplifyExpressions);
 			backend->addPass(new AstRemoveUndef);
 			backend->addPass(new AstBranchCombine);
+			backend->addPass(new AstSimplifyExpressions);
 			backend->addPass(new AstPrint(output));
 	
 			legacy::PassManager outputPhase;
@@ -430,7 +587,6 @@ namespace
 			initializeVectorization(pr);
 			initializeIPO(pr);
 			initializeAnalysis(pr);
-			initializeIPA(pr);
 			initializeTransformUtils(pr);
 			initializeInstCombine(pr);
 			initializeScalarOpts(pr);
@@ -444,36 +600,66 @@ namespace
 			initializeAstBackEndPass(pr);
 			initializeSESELoopPass(pr);
 		}
-	
+		
 		bool prepareOptimizationPasses()
 		{
-			PassRegistry* pr = PassRegistry::getPassRegistry();
-			for (const string& pass : ::additionalPasses)
+			// Default passes
+			vector<string> passNames = {
+				"globaldce",
+				"fixindirects",
+				"argrec",
+				"modulethinner",
+				"signext",
+				"simplifyconditions",
+				// <-- custom passes go here with the default pass pipeline
+				"instcombine",
+				"sroa",
+				"instcombine",
+				"gvn",
+				"simplifycfg",
+				"instcombine",
+				"gvn",
+				"recoverstackframe",
+				"dse",
+				"sccp",
+				"simplifycfg",
+				"eliminatecasts",
+				"instcombine",
+				"memssadle",
+				"dse",
+				"instcombine",
+				"sroa",
+				"instcombine",
+				"globaldce",
+				"simplifycfg",
+			};
+			
+			if (customPassPipeline == "default")
 			{
-				auto ext = sys::path::extension(pass);
-				if (ext == ".py" || ext == ".pyc" || ext == ".pyo")
+				if (additionalPasses.size() > 0)
 				{
-					if (auto passOrError = python.createPass(pass))
-					{
-						additionalPasses.push_back(passOrError.get());
-					}
-					else
-					{
-						cerr << getProgramName() << ": couldn't load " << pass << ": " << errorOf(passOrError) << endl;
-						return false;
-					}
+					auto extensionPoint = find(passNames.begin(), passNames.end(), "simplifyconditions") + 1;
+					passNames.insert(extensionPoint, additionalPasses.begin(), additionalPasses.end());
 				}
-				else if (const PassInfo* pi = pr->getPassInfo(pass))
+				optimizeAndTransformPasses = createPassesFromList(passNames);
+			}
+			else if (customPassPipeline == "")
+			{
+				if (auto editor = sys::Process::GetEnv("EDITOR"))
 				{
-					additionalPasses.push_back(pi->createPass());
+					optimizeAndTransformPasses = interactivelyEditPassPipeline(editor.getValue(), passNames);
 				}
 				else
 				{
-					cerr << getProgramName() << ": couldn't identify pass " << pass << endl;
+					errs() << getProgramName() << ": environment has no EDITOR variable; pass pipeline can't be edited interactively\n";
 					return false;
 				}
 			}
-			return true;
+			else
+			{
+				optimizeAndTransformPasses = readPassPipelineFromString(customPassPipeline);
+			}
+			return optimizeAndTransformPasses.size() > 0;
 		}
 	};
 }
@@ -505,6 +691,14 @@ int main(int argc, char** argv)
 {
 	pruneOptionList(cl::getRegisteredOptions());
 	cl::ParseCommandLineOptions(argc, argv, "native program decompiler");
+	
+	if (customPassPipeline != "default" && additionalPasses.size() > 0)
+	{
+		errs() << sys::path::filename(argv[0]) << ": additional passes only accepted when using the default pipeline\n";
+		errs() << "Specify custom passes using the " << customPassPipeline.ArgStr << " parameter\n";
+		return 1;
+	}
+	
 	Main::initializePasses();
 	
 	Main mainObj(argc, argv);
@@ -521,7 +715,7 @@ int main(int argc, char** argv)
 	unique_ptr<Module> module;
 	
 	// step one: create annotated module from executable (or load it from .ll)
-	if (inputIsModule)
+	if (moduleInCount())
 	{
 		SMDiagnostic errors;
 		module = parseIRFile(inputFile, errors, mainObj.getContext());
@@ -560,16 +754,39 @@ int main(int argc, char** argv)
 	}
 	
 	// if we want module output, this is where we stop
-	if (outputIsModule)
+	if (moduleOutCount() == 1)
 	{
 		module->print(outs(), nullptr);
 		return 0;
 	}
 	
-	// step two: optimize module
-	if (!mainObj.optimizeAndTransformModule(*module, errs(), executable.get()))
+	if (moduleInCount() < 2)
 	{
-		return 1;
+		// step two: pe-optimize module
+		if (!mainObj.preoptimizeModule(*module, errs(), executable.get()))
+		{
+			return 1;
+		}
+	}
+	
+	if (moduleOutCount() == 2)
+	{
+		module->print(outs(), nullptr);
+		return 0;
+	}
+	
+	if (moduleInCount() < 3)
+	{
+		if (!mainObj.optimizeAndTransformModule(*module, errs(), executable.get()))
+		{
+			return 1;
+		}
+	}
+	
+	if (moduleOutCount() > 2)
+	{
+		module->print(outs(), nullptr);
+		return 0;
 	}
 	
 	// step three (final step): emit pseudocode

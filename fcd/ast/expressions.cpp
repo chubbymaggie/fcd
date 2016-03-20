@@ -19,10 +19,10 @@
 // along with fcd.  If not, see <http://www.gnu.org/licenses/>.
 //
 
+#include "ast_context.h"
 #include "expressions.h"
 #include "function.h"
 #include "statements.h"
-#include "visitor.h"
 #include "print.h"
 
 SILENCE_LLVM_WARNINGS_BEGIN()
@@ -30,68 +30,39 @@ SILENCE_LLVM_WARNINGS_BEGIN()
 SILENCE_LLVM_WARNINGS_END()
 
 #include <cstring>
+#include <deque>
+#include <unordered_set>
 
 using namespace llvm;
 using namespace std;
 
 namespace
 {
-	TokenExpression trueExpression("true");
-	TokenExpression falseExpression("false");
-	TokenExpression undefExpression("__undefined");
-	TokenExpression unusedExpression("__unused");
-	TokenExpression nullExpression("null");
-}
-
-void Expression::print(raw_ostream& os) const
-{
-	ExpressionPrintVisitor printer(os);
-	const_cast<Expression&>(*this).visit(printer);
-}
-
-void Expression::dump() const
-{
-	print(errs());
-}
-
-bool UnaryOperatorExpression::operator==(const Expression& that) const
-{
-	if (auto unaryThat = llvm::dyn_cast<UnaryOperatorExpression>(&that))
-	if (unaryThat->type == type)
+	template<typename Collection, typename Iter>
+	void collectPointers(Collection& coll, Iter begin, Iter end)
 	{
-		return *operand == *unaryThat->operand;
+		for (auto iter = begin; iter != end; ++iter)
+		{
+			coll.push_back(&*iter);
+		}
 	}
-	return false;
-}
-
-void UnaryOperatorExpression::visit(ExpressionVisitor &visitor)
-{
-	visitor.visitUnary(this);
-}
-
-void NAryOperatorExpression::addOperand(Expression *expression)
-{
-	if (auto asNAry = dyn_cast<NAryOperatorExpression>(expression))
-	if (asNAry->type == type)
+	
+	void getAncestry(SmallVectorImpl<NOT_NULL(Statement)>& ancestry, Statement& statement)
 	{
-		operands.push_back(asNAry->operands.begin(), asNAry->operands.end());
-		return;
+		ancestry.clear();
+		for (Statement* current = &statement; current != nullptr; current = current->getParent())
+		{
+			ancestry.push_back(current);
+		}
+		reverse(ancestry.begin(), ancestry.end());
 	}
-	operands.push_back(expression);
 }
 
-void NAryOperatorExpression::visit(ExpressionVisitor &visitor)
+bool Expression::defaultEqualityCheck(const Expression &a, const Expression &b)
 {
-	visitor.visitNAry(this);
-}
-
-bool NAryOperatorExpression::operator==(const Expression& that) const
-{
-	if (auto naryThat = llvm::dyn_cast<NAryOperatorExpression>(&that))
-	if (naryThat->type == type)
-	if (operands.size() == naryThat->operands.size())
+	if (a.getUserType() == b.getUserType() && a.operands_size() == b.operands_size())
 	{
-		return std::equal(operands.cbegin(), operands.cend(), naryThat->operands.cbegin(), [](const Expression* a, const Expression* b)
+		return std::equal(a.operands_begin(), a.operands_end(), b.operands_begin(), [](const Expression* a, const Expression* b)
 		{
 			return *a == *b;
 		});
@@ -99,23 +70,183 @@ bool NAryOperatorExpression::operator==(const Expression& that) const
 	return false;
 }
 
-void TernaryExpression::visit(ExpressionVisitor &visitor)
+unsigned Expression::uses_size() const
 {
-	visitor.visitTernary(this);
+	unsigned size = 0;
+	for (auto iter = uses_begin(); iter != uses_end(); ++iter)
+	{
+		++size;
+	}
+	return size;
 }
 
-bool TernaryExpression::operator==(const Expression& that) const
+void Expression::replaceAllUsesWith(Expression *expression)
 {
-	if (auto ternary = llvm::dyn_cast<TernaryExpression>(&that))
+	if (expression == this)
 	{
-		return *ifTrue == *ternary->ifTrue && *ifFalse == *ternary->ifFalse;
+		return;
+	}
+	
+	while (auto use = firstUse)
+	{
+		use->setUse(expression);
+	}
+}
+
+Statement* Expression::ancestorOfAllUses()
+{
+	// collect all user statements then find their common ancestor
+	std::deque<Statement*> statements;
+	std::unordered_set<ExpressionUser*> users;
+	std::deque<ExpressionUse*> allUses;
+	collectPointers(allUses, uses_begin(), uses_end());
+	while (allUses.size() > 0)
+	{
+		auto iter = allUses.begin();
+		auto user = (*iter)->getUser();
+		allUses.erase(iter);
+		if (users.insert(user).second)
+		{
+			if (auto stmt = dyn_cast<Statement>(user))
+			{
+				statements.push_back(stmt);
+			}
+			else
+			{
+				auto expr = cast<Expression>(user);
+				collectPointers(allUses, expr->uses_begin(), expr->uses_end());
+			}
+		}
+	}
+	
+	auto iter = statements.begin();
+	if (iter == statements.end())
+	{
+		return nullptr;
+	}
+	
+	SmallVector<NOT_NULL(Statement), 10> ancestry;
+	getAncestry(ancestry, **iter);
+	for (++iter; iter != statements.end(); ++iter)
+	{
+		SmallVector<NOT_NULL(Statement), 10> runningAncestry;
+		getAncestry(runningAncestry, **iter);
+		
+		auto eraseFrom = mismatch(ancestry.begin(), ancestry.end(), runningAncestry.begin(), runningAncestry.end());
+		ancestry.erase(eraseFrom.first, ancestry.end());
+		if (ancestry.size() == 0)
+		{
+			return nullptr;
+		}
+	}
+	
+	return ancestry.back();
+}
+
+const ExpressionType& UnaryOperatorExpression::getExpressionType(AstContext &context) const
+{
+	const ExpressionType& operandType = getOperand()->getExpressionType(context);
+	switch (getType())
+	{
+		case Increment:
+		case Decrement:
+		case LogicalNegate:
+			return operandType;
+			
+		case AddressOf:
+			return context.getPointerTo(operandType);
+			
+		case Dereference:
+			return cast<PointerExpressionType>(operandType).getNestedType();
+			
+		default:
+			llvm_unreachable("don't know how to infer expression type");
+	}
+}
+
+bool UnaryOperatorExpression::operator==(const Expression& that) const
+{
+	if (auto unaryThat = llvm::dyn_cast<UnaryOperatorExpression>(&that))
+	if (unaryThat->type == type)
+	{
+		return *getOperand() == *unaryThat->getOperand();
 	}
 	return false;
 }
 
-void NumericExpression::visit(ExpressionVisitor &visitor)
+const ExpressionType& NAryOperatorExpression::getExpressionType(AstContext &context) const
 {
-	visitor.visitNumeric(this);
+	switch (getType())
+	{
+		case Multiply:
+		case Divide:
+		case Modulus:
+		case Add:
+		case Subtract:
+		case ShiftLeft:
+		case ShiftRight:
+		case BitwiseAnd:
+		case BitwiseOr:
+		case BitwiseXor:
+			return getOperand(0)->getExpressionType(context);
+			
+		case ShortCircuitAnd:
+		case ShortCircuitOr:
+		case ComparisonMin ... static_cast<NAryOperatorType>(ComparisonMax - 1):
+			return context.getIntegerType(false, 1);
+			
+		default:
+			llvm_unreachable("don't know how to infer expression type");
+	}
+}
+
+bool NAryOperatorExpression::operator==(const Expression& that) const
+{
+	return defaultEqualityCheck(*this, that);
+}
+
+pair<ExpressionUser::UserType, const StructExpressionType*> MemberAccessExpression::createInitInfo(AstContext& ctx, const Expression &base)
+{
+	const ExpressionType& baseType = base.getExpressionType(ctx);
+	if (auto ptrType = dyn_cast<PointerExpressionType>(&baseType))
+	{
+		return make_pair(ExpressionUser::PointerAccess, cast<StructExpressionType>(&ptrType->getNestedType()));
+	}
+	else
+	{
+		return make_pair(ExpressionUser::MemberAccess, cast<StructExpressionType>(&baseType));
+	}
+}
+
+
+const std::string& MemberAccessExpression::getFieldName() const
+{
+	return structureType[fieldIndex].name;
+}
+
+const ExpressionType& MemberAccessExpression::getExpressionType(AstContext&) const
+{
+	return structureType[fieldIndex].type;
+}
+
+bool MemberAccessExpression::operator==(const Expression &that) const
+{
+	if (defaultEqualityCheck(*this, that))
+	{
+		const auto& thatAccess = cast<MemberAccessExpression>(that);
+		return thatAccess.fieldIndex == fieldIndex && &thatAccess.structureType == &structureType;
+	}
+	return false;
+}
+
+const ExpressionType& TernaryExpression::getExpressionType(AstContext &context) const
+{
+	return getTrueValue()->getExpressionType(context);
+}
+
+bool TernaryExpression::operator==(const Expression& that) const
+{
+	return defaultEqualityCheck(*this, that);
 }
 
 bool NumericExpression::operator==(const Expression& that) const
@@ -127,15 +258,11 @@ bool NumericExpression::operator==(const Expression& that) const
 	return false;
 }
 
-TokenExpression* TokenExpression::trueExpression = &::trueExpression;
-TokenExpression* TokenExpression::falseExpression = &::falseExpression;
-TokenExpression* TokenExpression::undefExpression = &::undefExpression;
-TokenExpression* TokenExpression::unusedExpression = &::unusedExpression;
-TokenExpression* TokenExpression::nullExpression = &::nullExpression;
 
-void TokenExpression::visit(ExpressionVisitor &visitor)
+TokenExpression::TokenExpression(AstContext& ctx, unsigned uses, const ExpressionType& type, llvm::StringRef token)
+: Expression(Token, ctx, uses), expressionType(type), token(ctx.getPool().copyString(token))
 {
-	visitor.visitToken(this);
+	assert(uses == 0);
 }
 
 bool TokenExpression::operator==(const Expression& that) const
@@ -147,82 +274,82 @@ bool TokenExpression::operator==(const Expression& that) const
 	return false;
 }
 
-void CallExpression::visit(ExpressionVisitor &visitor)
+const ExpressionType& CallExpression::getExpressionType(AstContext& ctx) const
 {
-	visitor.visitCall(this);
+	const auto& pointerType = cast<PointerExpressionType>(getCallee()->getExpressionType(ctx));
+	const auto& functionType = cast<FunctionExpressionType>(pointerType.getNestedType());
+	return functionType.getReturnType();
 }
 
 bool CallExpression::operator==(const Expression& that) const
 {
-	if (auto thatCall = llvm::dyn_cast<CallExpression>(&that))
-	if (this->callee == thatCall->callee)
-	if (parameters.size() == thatCall->parameters.size())
-	{
-		return std::equal(parameters.begin(), parameters.end(), thatCall->parameters.begin(), [](Expression* a, Expression* b)
-		{
-			return *a == *b;
-		});
-	}
-	return false;
+	return defaultEqualityCheck(*this, that);
 }
 
-void CastExpression::visit(ExpressionVisitor &visitor)
+CallExpression::iterator CallExpression::params_begin()
 {
-	visitor.visitCast(this);
+	auto iter = operands_begin();
+	++iter;
+	return iter;
+}
+
+CallExpression::const_iterator CallExpression::params_begin() const
+{
+	auto iter = operands_begin();
+	++iter;
+	return iter;
 }
 
 bool CastExpression::operator==(const Expression& that) const
 {
-	if (auto thatCast = llvm::dyn_cast<CastExpression>(&that))
-	{
-		return *type == *thatCast->type && *casted == *thatCast->casted;
-	}
-	return false;
-}
-
-void AggregateExpression::visit(ExpressionVisitor &visitor)
-{
-	visitor.visitAggregate(this);
+	return defaultEqualityCheck(*this, that);
 }
 
 bool AggregateExpression::operator==(const Expression& that) const
 {
-	if (auto thatAggregate = dyn_cast<AggregateExpression>(&that))
-	if (thatAggregate->values.size() == values.size())
-	{
-		return std::equal(values.begin(), values.end(), thatAggregate->values.begin(), [](Expression* a, Expression* b)
-		{
-			return *a == *b;
-		});
-	}
-	return false;
+	return defaultEqualityCheck(*this, that);
 }
 
-AggregateExpression* AggregateExpression::copyWithNewItem(DumbAllocator& pool, unsigned int index, NOT_NULL(Expression) expression) const
+AggregateExpression* AggregateExpression::copyWithNewItem(unsigned int index, NOT_NULL(Expression) expression)
 {
-	AggregateExpression* copy = pool.allocate<AggregateExpression>(pool);
-	copy->values.push_back(values.begin(), values.end());
-	copy->values[index] = expression;
+	auto copy = ctx.aggregate(getExpressionType(ctx), operands_size());
+	unsigned i = 0;
+	for (ExpressionUse& use : operands())
+	{
+		copy->setOperand(i, i == index ? static_cast<Expression*>(expression) : use.getUse());
+		++i;
+	}
 	return copy;
 }
 
-void SubscriptExpression::visit(ExpressionVisitor &visitor)
+const ExpressionType& SubscriptExpression::getExpressionType(AstContext& context) const
 {
-	visitor.visitSubscript(this);
+	const ExpressionType* baseType = &getPointer()->getExpressionType(context);
+	if (auto ptrType = dyn_cast<PointerExpressionType>(baseType))
+	{
+		return ptrType->getNestedType();
+	}
+	else if (auto arrayType = dyn_cast<ArrayExpressionType>(baseType))
+	{
+		return arrayType->getNestedType();
+	}
+	else
+	{
+		llvm_unreachable("don't know how to infer type");
+	}
 }
 
 bool SubscriptExpression::operator==(const Expression& that) const
 {
-	if (auto thatSubscript = dyn_cast<SubscriptExpression>(&that))
-	{
-		return index == thatSubscript->index && *left == *thatSubscript->left;
-	}
-	return false;
+	return defaultEqualityCheck(*this, that);
 }
 
-void AssemblyExpression::visit(ExpressionVisitor &visitor)
+AssemblyExpression::AssemblyExpression(AstContext& ctx, unsigned uses, const FunctionExpressionType& type, StringRef assembly)
+: Expression(Assembly, ctx, uses)
+, expressionType(ctx.getPointerTo(type))
+, assembly(ctx.getPool().copyString(assembly))
 {
-	visitor.visitAssembly(this);
+	assert(uses == 0);
 }
 
 bool AssemblyExpression::operator==(const Expression& that) const
@@ -230,6 +357,24 @@ bool AssemblyExpression::operator==(const Expression& that) const
 	if (auto thatAsm = dyn_cast<AssemblyExpression>(&that))
 	{
 		return strcmp(assembly, thatAsm->assembly) == 0;
+	}
+	return false;
+}
+
+AssignableExpression::AssignableExpression(AstContext& ctx, unsigned uses, const ExpressionType& type, StringRef assembly)
+: Expression(Assignable, ctx, uses)
+, expressionType(type)
+, prefix(ctx.getPool().copyString(assembly))
+{
+	assert(uses == 0);
+}
+
+bool AssignableExpression::operator==(const Expression& that) const
+{
+	if (auto thatAssignable = dyn_cast<AssignableExpression>(&that))
+	{
+		return &expressionType == &thatAssignable->expressionType
+			&& strcmp(prefix, thatAssignable->prefix) == 0;
 	}
 	return false;
 }

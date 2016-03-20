@@ -13,6 +13,12 @@
 #ifndef fcd__dumb_allocator_h
 #define fcd__dumb_allocator_h
 
+#include "llvm_warnings.h"
+
+SILENCE_LLVM_WARNINGS_BEGIN()
+#include <llvm/ADT/StringRef.h>
+SILENCE_LLVM_WARNINGS_END()
+
 #include <algorithm>
 #include <cassert>
 #include <iterator>
@@ -36,7 +42,7 @@ class DumbAllocator
 	std::list<std::unique_ptr<char[]>> pool;
 	size_t offset;
 	
-	inline char* allocateSmall(size_t size)
+	inline char* allocateSmall(size_t size, size_t alignment)
 	{
 		assert(size <= DefaultPageSize);
 		if (offset < size)
@@ -46,13 +52,25 @@ class DumbAllocator
 			offset = DefaultPageSize;
 		}
 		
+		auto& lastPage = pool.back();
+		auto endOffset = reinterpret_cast<uintptr_t>(&lastPage[offset]);
+		size += (endOffset - size) & (alignment - 1);
 		offset -= size;
 		return &pool.back()[offset];
 	}
 	
-	inline char* allocateLarge(size_t size)
+	inline char* allocateLarge(size_t size, size_t alignment)
 	{
-		char* bytes = new char[size];
+		char* bytes = nullptr;
+		if (alignment <= alignof(std::max_align_t))
+		{
+			bytes = new char[size];
+		}
+		else
+		{
+			assert(false && "not implemented");
+			return nullptr;
+		}
 		pool.emplace_front(bytes);
 		return pool.front().get();
 	}
@@ -74,7 +92,7 @@ public:
 	typename std::enable_if<sizeof(T) < HalfPageSize && std::is_trivially_destructible<T>::value, T>::type*
 	allocate(TParams&&... params)
 	{
-		char* address = allocateSmall(sizeof (T));
+		char* address = allocateSmall(sizeof(T), alignof(T));
 		return new (address) T(params...);
 	}
 	
@@ -82,12 +100,12 @@ public:
 	typename std::enable_if<sizeof(T) >= HalfPageSize && std::is_trivially_destructible<T>::value, T>::type*
 	allocate(TParams&&... params)
 	{
-		char* address = allocateLarge(sizeof (T));
+		char* address = allocateLarge(sizeof(T), alignof(T));
 		return new (address) T(params...);
 	}
 	
 	template<typename T>
-	T* allocateDynamic(size_t count = 1)
+	T* allocateDynamic(size_t count = 1, size_t alignment = alignof(T))
 	{
 		size_t totalSize;
 		if (__builtin_umull_overflow(count, sizeof(T), &totalSize))
@@ -98,9 +116,9 @@ public:
 		
 		if (totalSize < HalfPageSize)
 		{
-			return new (allocateSmall(totalSize)) T[count];
+			return new (allocateSmall(totalSize, alignment)) T[count];
 		}
-		return new (allocateLarge(totalSize)) T[count];
+		return new (allocateLarge(totalSize, alignment)) T[count];
 	}
 	
 	char* copyString(const char* begin, const char* end)
@@ -116,6 +134,11 @@ public:
 			}
 		}
 		return nullptr;
+	}
+	
+	char* copyString(llvm::StringRef string)
+	{
+		return copyString(string.begin(), string.end());
 	}
 };
 
@@ -257,9 +280,10 @@ public:
 	PooledDeque(DumbAllocator& pool)
 	: pool(pool)
 	{
-		first = &empty;
-		last = first;
+		clear();
 	}
+	
+	DumbAllocator& getPool() { return pool; }
 	
 	void push_back(const T& item)
 	{
@@ -275,6 +299,12 @@ public:
 		{
 			push_back(*iter);
 		}
+	}
+	
+	void clear()
+	{
+		first = &empty;
+		last = first;
 	}
 	
 	size_t size() const
