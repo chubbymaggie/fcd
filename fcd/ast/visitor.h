@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__ast_visitor_h
@@ -44,8 +32,6 @@ public:
 	{
 		switch (user.getUserType())
 		{
-			SWITCH_CASE(Statement, Noop);
-			SWITCH_CASE(Statement, Sequence);
 			SWITCH_CASE(Statement, IfElse);
 			SWITCH_CASE(Statement, Loop);
 			SWITCH_CASE(Statement, Keyword);
@@ -63,6 +49,8 @@ public:
 			SWITCH_CASE(Expression, Assembly);
 			SWITCH_CASE(Expression, Assignable);
 			
+			case ExpressionUser::Temporary:
+				return d().visitTemporary(user);
 			case ExpressionUser::Expr:
 				return d().visitExpr(llvm::cast<ExpressionStatement>(user));
 			default:
@@ -70,12 +58,9 @@ public:
 		}
 	}
 	
-	DELEGATE_CALL(Statement, Noop)
-	DELEGATE_CALL(Statement, Sequence)
 	DELEGATE_CALL(Statement, IfElse)
 	DELEGATE_CALL(Statement, Loop)
 	DELEGATE_CALL(Statement, Keyword)
-	
 	ReturnType visitExpr(OptionallyConst<UsesConst, ExpressionStatement>& expr) { return d().visitStatement(expr); }
 	
 	DELEGATE_CALL(Expression, Token)
@@ -96,16 +81,53 @@ public:
 		return d().visitDefault(statement);
 	}
 	
+	ReturnType visitTemporary(OptionallyConst<UsesConst, ExpressionUser>& reference)
+	{
+		return d().visitDefault(reference);
+	}
+	
 	ReturnType visitExpression(OptionallyConst<UsesConst, Expression>& expression)
 	{
 		return d().visitDefault(expression);
 	}
 	
+	// Called when nothing else matches.
 	// not implemented: needs to have an implementation in the subclass
 	ReturnType visitDefault(OptionallyConst<UsesConst, ExpressionUser>& user);
 };
 
 #undef DELEGATE_CALL
 #undef SWITCH_CASE
+
+template<typename Derived>
+StatementReference visitAll(AstVisitor<Derived, false, Statement*>& visitor, StatementList&& list)
+{
+	StatementReference result;
+	while (!list.empty())
+	{
+		result->push_back(visitor.visit(*list.pop_front()));
+	}
+	return result;
+}
+
+template<typename Derived>
+StatementReference visitAll(AstVisitor<Derived, false, StatementReference>& visitor, StatementList&& list)
+{
+	StatementReference result;
+	while (!list.empty())
+	{
+		result->push_back(visitor.visit(*list.pop_front()).take());
+	}
+	return result;
+}
+
+template<typename Derived, bool IsConst>
+void visitAll(AstVisitor<Derived, IsConst, void>& visitor, typename std::conditional<IsConst, const StatementList, StatementList>::type& list)
+{
+	for (auto statement : list)
+	{
+		visitor.visit(*statement);
+	}
+}
 
 #endif /* fcd__ast_visitor_h */

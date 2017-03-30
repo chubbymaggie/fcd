@@ -3,30 +3,16 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "code_generator.h"
 #include "metadata.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <llvm/Support/SourceMgr.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <string>
 
@@ -47,7 +33,7 @@ namespace
 		llvm_unreachable("invalid pointer size");
 	}
 	
-	class x86CodeGenerator : public CodeGenerator
+	class x86CodeGenerator final : public CodeGenerator
 	{
 		Value* ipOffset[3];
 		vector<Function*> declarations;
@@ -59,6 +45,41 @@ namespace
 			};
 			
 			return x86Intrins.count(name) != 0;
+		}
+		
+		Value* buildMemoryAddress(Value& segment, Value& pointer, Value& size, Instruction& location)
+		{
+			uint64_t loadSize = cast<ConstantInt>(size).getLimitedValue();
+			Type* loadType = getMemoryType(size.getContext(), loadSize)->getPointerTo();
+			x86_reg segmentReg = static_cast<x86_reg>(cast<ConstantInt>(segment).getLimitedValue());
+			
+			switch (segmentReg)
+			{
+				case X86_REG_INVALID:
+				case X86_REG_CS:
+				case X86_REG_DS:
+				case X86_REG_ES:
+				case X86_REG_SS:
+					// "obvious"/invalid segment, discard
+					return CastInst::Create(CastInst::IntToPtr, &pointer, loadType, "", &location);
+					
+				case X86_REG_FS:
+				case X86_REG_GS:
+					break;
+					
+				default:
+					llvm_unreachable("invalid segment register!");
+			}
+			
+			char segmentFuncName[] = "__Ss_ptr_512";
+			snprintf(segmentFuncName, sizeof segmentFuncName, "__%cs_ptr_i%" PRIu64,
+				segmentReg == X86_REG_FS ? 'f' : 'g',
+				loadSize * 8);
+			
+			Module* module = location.getParent()->getParent()->getParent();
+			FunctionType* segmentFuncType = FunctionType::get(loadType, { pointer.getType() }, false);
+			Function* segmentFunc = cast<Function>(module->getOrInsertFunction(segmentFuncName, segmentFuncType, AttributeSet()));
+			return CallInst::Create(segmentFunc, { &pointer }, "", &location);
 		}
 		
 		void replaceIntrinsic(AddressToFunction& funcMap, AddressToBlock& blockMap, StringRef name, CallInst* translated)
@@ -95,14 +116,15 @@ namespace
 				BasicBlock* remainder = parent->splitBasicBlock(translated);
 				parent->getTerminator()->eraseFromParent();
 				remainder->eraseFromParent();
-				ReturnInst::Create(translated->getContext(), parent);
+				ReturnInst::Create(parent->getContext(), parent);
 			}
 			else if (name == "x86_read_mem")
 			{
-				Value* intptr = translated->getOperand(0);
-				ConstantInt* sizeOperand = cast<ConstantInt>(translated->getOperand(1));
-				Type* loadType = getMemoryType(translated->getContext(), sizeOperand->getLimitedValue());
-				CastInst* pointer = CastInst::Create(CastInst::IntToPtr, intptr, loadType->getPointerTo(), "", translated);
+				Value* segment = translated->getOperand(0);
+				Value* intptr = translated->getOperand(1);
+				Value* size = translated->getOperand(2);
+				Value* pointer = buildMemoryAddress(*segment, *intptr, *size, *translated);
+				
 				Instruction* replacement = new LoadInst(pointer, "", translated);
 				md::setProgramMemory(*replacement);
 				
@@ -116,16 +138,19 @@ namespace
 			}
 			else if (name == "x86_write_mem")
 			{
-				Value* intptr = translated->getOperand(0);
-				Value* value = translated->getOperand(2);
-				ConstantInt* sizeOperand = cast<ConstantInt>(translated->getOperand(1));
-				Type* storeType = getMemoryType(translated->getContext(), sizeOperand->getLimitedValue());
-				CastInst* pointer = CastInst::Create(CastInst::IntToPtr, intptr, storeType->getPointerTo(), "", translated);
+				Value* segment = translated->getOperand(0);
+				Value* intptr = translated->getOperand(1);
+				Value* size = translated->getOperand(2);
+				Value* value = translated->getOperand(3);
+				Value* pointer = buildMemoryAddress(*segment, *intptr, *size, *translated);
 				
-				if (value->getType() != storeType)
+				// PointerType->getElementType() will eventually go away.
+				// However, when that happens, so can this check.
+				Type* elementType = cast<PointerType>(pointer->getType())->getElementType();
+				if (value->getType() != elementType)
 				{
 					// Assumption: storeType can only be smaller than the type of storeValue
-					value = CastInst::Create(Instruction::Trunc, value, storeType, "", translated);
+					value = CastInst::Create(Instruction::Trunc, value, elementType, "", translated);
 				}
 				StoreInst* storeInst = new StoreInst(value, pointer, translated);
 				md::setProgramMemory(*storeInst);
@@ -219,7 +244,7 @@ namespace
 					ConstantInt::get(int32Ty, cs.operands[i].mem.segment),
 					ConstantInt::get(int32Ty, cs.operands[i].mem.base),
 					ConstantInt::get(int32Ty, cs.operands[i].mem.index),
-					ConstantInt::get(int32Ty, cs.operands[i].mem.scale),
+					ConstantInt::get(int32Ty, static_cast<unsigned>(cs.operands[i].mem.scale)),
 					ConstantInt::get(int64Ty, cs.operands[i].mem.disp),
 				};
 				Constant* opMem = ConstantStruct::get(x86OpMem, structFields);
@@ -290,8 +315,10 @@ CodeGenerator::CodeGenerator(llvm::LLVMContext& ctx)
 
 bool CodeGenerator::initGenerator(const char* begin, const char* end)
 {
+	assert(end >= begin);
+	
 	SMDiagnostic errors;
-	MemoryBufferRef buffer(StringRef(begin, end - begin), "IRImplementation");
+	MemoryBufferRef buffer(StringRef(begin, static_cast<uintptr_t>(end - begin)), "IRImplementation");
 	if (auto module = parseIR(buffer, errors, ctx))
 	{
 		generatorModule = move(module);
@@ -325,7 +352,7 @@ void CodeGenerator::inlineFunction(Function *target, Function *toInline, ArrayRe
 	getModuleLevelValueChanges(valueMap, targetModule);
 	for (Value* parameter : parameters)
 	{
-		valueMap[static_cast<Argument*>(iter)] = parameter;
+		valueMap[&*iter] = parameter;
 		++iter;
 	}
 	
@@ -336,7 +363,7 @@ void CodeGenerator::inlineFunction(Function *target, Function *toInline, ArrayRe
 	// Stitch blocks together
 	Function::iterator firstNewBlock = blockBeforeInstruction;
 	++firstNewBlock;
-	BranchInst::Create(static_cast<BasicBlock*>(firstNewBlock), static_cast<BasicBlock*>(blockBeforeInstruction));
+	BranchInst::Create(&*firstNewBlock, &*blockBeforeInstruction);
 	
 	// Redirect returns
 	BasicBlock* nextBlock = blockMap.blockToInstruction(nextAddress);

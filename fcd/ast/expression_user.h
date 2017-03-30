@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef expression_user_hpp
@@ -69,11 +57,11 @@ class ExpressionUser
 public:
 	enum UserType : unsigned
 	{
+		Temporary,
+		
 		// statements
 		StatementMin,
-		Noop = StatementMin,
-		Sequence,
-		IfElse,
+		IfElse = StatementMin,
 		Loop,
 		Expr,
 		Keyword,
@@ -147,16 +135,16 @@ private:
 	ExpressionUseAllocInfo allocInfo;
 	UserType userType;
 	
-	// force class to have a vtable
+	// force class to have a vtable (we cannot have a destructor, virtual or not)
 	virtual void anchor();
 	
 protected:
-	ExpressionUse& insertUseAtEnd();
-	iterator erase(iterator iter); // protected because not every class will want to expose it
+	virtual void dropAllExpressionReferences();
+	virtual void dropAllStatementReferences();
 	
 public:
 	ExpressionUser(UserType type, unsigned allocatedUses, unsigned usedUses)
-	: userType(type), allocInfo(allocatedUses, usedUses)
+	: allocInfo(allocatedUses, usedUses), userType(type)
 	{
 	}
 	
@@ -180,13 +168,40 @@ public:
 	const_iterator operands_cbegin() const { return operands_begin(); }
 	const_iterator operands_end() const { return const_iterator(nullptr); }
 	const_iterator operands_cend() const { return operands_end(); }
-	iterator operands_begin() { return iterator(this); }
+	iterator operands_begin() { return iterator(allocInfo.allocated == 0 ? nullptr : this); }
 	iterator operands_end() { return iterator(nullptr); }
 	llvm::iterator_range<iterator> operands() { return llvm::make_range(operands_begin(), operands_end()); }
 	llvm::iterator_range<const_iterator> operands() const { return llvm::make_range(operands_begin(), operands_end()); }
 	
+	void dropAllReferences();
+	
 	void print(llvm::raw_ostream& os) const;
 	void dump() const;
+};
+
+// Use this to hold a reference to expressions that must not be dropped yet. (This is kind of like a shared_ptr for
+// expressions.) ExpressionReference is primarily meant to be used as a stack variable type.
+class [[gnu::packed]] ExpressionReference
+{
+	ExpressionUseArrayHead useArrayHead;
+	ExpressionUse singleUse;
+	ExpressionUser user;
+	
+public:
+	ExpressionReference(std::nullptr_t = nullptr);
+	ExpressionReference(Expression* expr);
+	ExpressionReference(const ExpressionReference& that);
+	ExpressionReference(ExpressionReference&& that);
+	
+	~ExpressionReference();
+	
+	ExpressionReference& operator=(Expression* expr);
+	ExpressionReference& operator=(const ExpressionReference& that);
+	ExpressionReference& operator=(ExpressionReference&& that);
+	
+	Expression* get() const { return const_cast<ExpressionUser&>(user).getOperand(0); }
+	
+	void reset(Expression* expr = nullptr);
 };
 
 template<bool IsConst>

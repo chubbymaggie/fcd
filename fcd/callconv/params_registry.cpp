@@ -3,25 +3,12 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "anyarch_anycc.h"
 #include "anyarch_interactive.h"
-#include "anyarch_lib.h"
 #include "call_conv.h"
 #include "command_line.h"
 #include "executable.h"
@@ -29,12 +16,10 @@
 #include "params_registry.h"
 #include "pass_executable.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Module.h>
-SILENCE_LLVM_WARNINGS_END()
 
 using namespace llvm;
 using namespace std;
@@ -58,7 +43,7 @@ namespace
 			}
 		};
 		
-		static inline vector<OptionInfo>& ccs()
+		static vector<OptionInfo>& ccs()
 		{
 			static vector<OptionInfo> callingConventions;
 			if (callingConventions.size() == 0)
@@ -70,7 +55,7 @@ namespace
 				
 				sort(callingConventions.begin(), callingConventions.end(), [](OptionInfo& a, OptionInfo& b)
 				{
-					return strcmp(a.Name, b.Name) < 0;
+					return a.Name < b.Name;
 				});
 				
 				callingConventions.emplace(callingConventions.begin(), nullptr, nullptr);
@@ -91,12 +76,12 @@ namespace
 			return static_cast<unsigned>(ccs().size());
 		}
 		
-		virtual const char* getOption(unsigned n) const override
+		virtual StringRef getOption(unsigned n) const override
 		{
 			return ccs().at(n).Name;
 		}
 		
-		virtual const char* getDescription(unsigned n) const override
+		virtual StringRef getDescription(unsigned n) const override
 		{
 			return ccs().at(n).HelpStr;
 		}
@@ -233,8 +218,6 @@ CallInformation* ParameterRegistry::analyzeFunction(Function& fn)
 
 void ParameterRegistry::setupCCChain()
 {
-	addCallingConvention(CallingConvention::getCallingConvention(CallingConvention_AnyArch_Library::name));
-	
 	if (defaultCC != nullptr)
 	{
 		addCallingConvention(defaultCC);
@@ -248,7 +231,7 @@ void ParameterRegistry::setupCCChain()
 		}
 	}
 	
-	if (ccChain.size() > 1)
+	if (ccChain.size() >= 1)
 	{
 		addCallingConvention(CallingConvention::getCallingConvention(CallingConvention_AnyArch_AnyCC::name));
 		addCallingConvention(CallingConvention::getCallingConvention(CallingConvention_AnyArch_Interactive::name));
@@ -269,8 +252,9 @@ Executable* ParameterRegistry::getExecutable()
 // - an empty entry when parameter inference is on the way;
 // - nullptr when analysis failed.
 // It is possible that analysis returns an empty set, but then returns nullptr.
-const CallInformation* ParameterRegistry::getCallInfo(llvm::Function &function)
+const CallInformation* ParameterRegistry::getCallInfo(Function &function)
 {
+	assert(!md::isPrototype(function));
 	auto iter = aaResults->callInformation.find(&function);
 	if (iter == aaResults->callInformation.end())
 	{
@@ -278,6 +262,30 @@ const CallInformation* ParameterRegistry::getCallInfo(llvm::Function &function)
 	}
 	
 	return &iter->second;
+}
+
+const CallInformation* ParameterRegistry::getDefinitionCallInfo(Function& function)
+{
+	assert(md::isPrototype(function));
+	
+	CallInformation& info = aaResults->callInformation[&function];
+	if (info.getStage() == CallInformation::New)
+	{
+		for (CallingConvention* cc : *this)
+		{
+			if (cc->analyzeFunctionType(*this, info, *function.getFunctionType()))
+			{
+				info.setCallingConvention(cc);
+				return &info;
+			}
+		}
+	}
+	else if (info.getStage() == CallInformation::Completed)
+	{
+		return &info;
+	}
+	
+	return nullptr;
 }
 
 unique_ptr<CallInformation> ParameterRegistry::analyzeCallSite(CallSite callSite)
@@ -303,26 +311,36 @@ unique_ptr<CallInformation> ParameterRegistry::analyzeCallSite(CallSite callSite
 	return info;
 }
 
-MemorySSA* ParameterRegistry::getMemorySSA(llvm::Function &function)
+unique_ptr<MemorySSA> ParameterRegistry::createMemorySSA(Function &function)
 {
+	auto& domTree = getAnalysis<DominatorTreeWrapperPass>(function).getDomTree();
+	auto& aaResult = getAnalysis<AAResultsWrapperPass>(function).getAAResults();
+	
+	// XXX: don't explicitly depend on this other AA pass
+	// This will be easier once we move over to the new pass infrastructure
+	aaResult.addAAResult(*aaHack);
+	
+	return std::make_unique<MemorySSA>(function, &aaResult, &domTree);
+}
+
+MemorySSA* ParameterRegistry::getMemorySSA(Function &function)
+{
+	unsigned version = md::getFunctionVersion(function);
 	auto iter = mssas.find(&function);
 	if (iter == mssas.end())
 	{
-		auto mssa = std::make_unique<MemorySSA>(function);
-		auto& domTree = getAnalysis<DominatorTreeWrapperPass>(function).getDomTree();
-		
-		// XXX: don't explicitly depend on this other AA pass
-		// This will be easier once we move over to the new pass infrastructure
-		auto& aaResult = getAnalysis<AAResultsWrapperPass>(function).getAAResults();
-		aaResult.addAAResult(*aaHack);
-		
-		mssa->buildMemorySSA(&aaResult, &domTree);
-		iter = mssas.insert(make_pair(&function, move(mssa))).first;
+		auto mssa = createMemorySSA(function);
+		iter = mssas.insert(make_pair(&function, make_pair(version, move(mssa)))).first;
 	}
-	return iter->second.get();
+	else if (iter->second.first != version)
+	{
+		iter->second.first = version;
+		iter->second.second = createMemorySSA(function);
+	}
+	return iter->second.second.get();
 }
 
-void ParameterRegistry::getAnalysisUsage(llvm::AnalysisUsage &au) const
+void ParameterRegistry::getAnalysisUsage(AnalysisUsage &au) const
 {
 	au.addRequired<AAResultsWrapperPass>();
 	
@@ -332,8 +350,8 @@ void ParameterRegistry::getAnalysisUsage(llvm::AnalysisUsage &au) const
 	au.addRequired<TargetLibraryInfoWrapperPass>();
 	au.addPreserved<TargetLibraryInfoWrapperPass>();
 	
-	au.addRequired<PostDominatorTree>();
-	au.addPreserved<PostDominatorTree>();
+	au.addRequired<PostDominatorTreeWrapperPass>();
+	au.addPreserved<PostDominatorTreeWrapperPass>();
 	
 	au.addRequired<ExecutableWrapper>();
 	au.addPreserved<ExecutableWrapper>();
@@ -349,7 +367,7 @@ void ParameterRegistry::getAnalysisUsage(llvm::AnalysisUsage &au) const
 	ModulePass::getAnalysisUsage(au);
 }
 
-const char* ParameterRegistry::getPassName() const
+StringRef ParameterRegistry::getPassName() const
 {
 	return "Parameter Registry";
 }
@@ -366,13 +384,10 @@ bool ParameterRegistry::doInitialization(Module& m)
 
 bool ParameterRegistry::runOnModule(Module& m)
 {
-	auto& tli = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
-	aaHack.reset(new ProgramMemoryAAResult(tli));
+	aaHack.reset(new ProgramMemoryAAResult);
 	setupCCChain();
 	
-	auto targetInfo = TargetInfo::getTargetInfo(m);
-	auto& targetLibInfo = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
-	aaResults.reset(new ParameterRegistryAAResults(targetLibInfo, move(targetInfo)));
+	aaResults.reset(new ParameterRegistryAAResults(TargetInfo::getTargetInfo(m)));
 	
 	TemporaryTrue isAnalyzing(analyzing);
 	for (auto& fn : m.getFunctionList())
@@ -390,5 +405,5 @@ INITIALIZE_PASS_BEGIN(ParameterRegistry, "paramreg", "ModRef info for registers"
 INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(PostDominatorTree)
+INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
 INITIALIZE_PASS_END(ParameterRegistry, "paramreg", "ModRef info for registers", false, true)

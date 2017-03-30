@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "expression_user.h"
@@ -64,6 +52,25 @@ void ExpressionUser::anchor()
 {
 }
 
+void ExpressionUser::dropAllExpressionReferences()
+{
+	for (ExpressionUse& use : operands())
+	{
+		if (auto expr = use.getUse())
+		{
+			use.setUse(nullptr);
+			if (expr->uses_empty())
+			{
+				expr->dropAllReferences();
+			}
+		}
+	}
+}
+
+void ExpressionUser::dropAllStatementReferences()
+{
+}
+
 ExpressionUse& ExpressionUser::getOperandUse(unsigned int index)
 {
 	ExpressionUse* result = nullptr;
@@ -96,6 +103,12 @@ unsigned ExpressionUser::operands_size() const
 	return count;
 }
 
+void ExpressionUser::dropAllReferences()
+{
+	dropAllExpressionReferences();
+	dropAllStatementReferences();
+}
+
 void ExpressionUser::print(raw_ostream& os) const
 {
 	// This doesn't really need the AstContext used to create the statements.
@@ -104,10 +117,75 @@ void ExpressionUser::print(raw_ostream& os) const
 	// outside of debug code.
 	DumbAllocator pool;
 	AstContext context(pool);
-	StatementPrintVisitor::print(context, os, *this, 0, false);
+	StatementPrintVisitor::print(context, os, *this, false);
 }
 
 void ExpressionUser::dump() const
 {
 	print(errs());
+}
+
+ExpressionReference::ExpressionReference(std::nullptr_t)
+: singleUse(ExpressionUse::FullStop), user(ExpressionUser::Temporary, 1, 1)
+{
+}
+
+ExpressionReference::ExpressionReference(Expression* expr)
+: ExpressionReference()
+{
+	user.setOperand(0, expr);
+}
+
+ExpressionReference::ExpressionReference(const ExpressionReference& that)
+: ExpressionReference(that.get())
+{
+}
+
+ExpressionReference::ExpressionReference(ExpressionReference&& that)
+: ExpressionReference(that.get())
+{
+	that.reset();
+}
+
+ExpressionReference::~ExpressionReference()
+{
+	user.dropAllReferences();
+}
+
+ExpressionReference& ExpressionReference::operator=(Expression* expr)
+{
+	if (expr != get())
+	{
+		reset(expr);
+	}
+	return *this;
+}
+
+ExpressionReference& ExpressionReference::operator=(const ExpressionReference &that)
+{
+	if (that.get() != get())
+	{
+		reset(that.get());
+	}
+	return *this;
+}
+
+ExpressionReference& ExpressionReference::operator=(ExpressionReference&& that)
+{
+	if (that.get() != get())
+	{
+		reset(that.get());
+	}
+	that.reset();
+	return *this;
+}
+
+void ExpressionReference::reset(Expression* expr)
+{
+	auto current = get();
+	user.setOperand(0, expr);
+	if (current != nullptr && current->uses_empty())
+	{
+		current->dropAllReferences();
+	}
 }

@@ -3,38 +3,25 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__pass_argrec_h
 #define fcd__pass_argrec_h
 
-#include "llvm_warnings.h"
 #include "params_registry.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/Passes.h>
 #include <llvm/IR/Module.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <unordered_map>
 
 class ArgumentRecovery final : public llvm::ModulePass
 {
 	std::unordered_map<const llvm::Function*, llvm::Value*> registerPtr;
+	llvm::SmallVector<llvm::Function*, 10> functionsToErase;
 	
 	llvm::Value* getRegisterPtr(llvm::Function& fn);
 	
@@ -51,8 +38,8 @@ public:
 	{
 	}
 	
-	static llvm::FunctionType* createFunctionType(TargetInfo& targetInfo, const CallInformation& ci, llvm::Module& module, llvm::StringRef returnTypeName);
-	static llvm::FunctionType* createFunctionType(TargetInfo& targetInfo, const CallInformation& ci, llvm::Module& module, llvm::StringRef returnTypeName, llvm::SmallVectorImpl<std::string>& parameterNames);
+	static llvm::FunctionType* createFunctionType(TargetInfo& targetInfo, const CallInformation& ci, llvm::Module& module, const std::string& returnTypeName);
+	static llvm::FunctionType* createFunctionType(TargetInfo& targetInfo, const CallInformation& ci, llvm::Module& module, const std::string& returnTypeName, llvm::SmallVectorImpl<std::string>& parameterNames);
 	static llvm::CallInst* createCallSite(TargetInfo& targetInfo, const CallInformation& ci, llvm::Value& callee, llvm::Value& callerRegisters, llvm::Instruction& insertionPoint);
 	
 	virtual void getAnalysisUsage(llvm::AnalysisUsage& au) const override;

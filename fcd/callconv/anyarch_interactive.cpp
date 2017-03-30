@@ -3,31 +3,16 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "anyarch_interactive.h"
 #include "cc_common.h"
-#include "llvm_warnings.h"
 #include "metadata.h"
 #include "targetinfo.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/Constants.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <iomanip>
 #include <iostream>
@@ -73,7 +58,8 @@ bool CallingConvention_AnyArch_Interactive::analyzeFunction(ParameterRegistry &r
 	cout << function.getName().str();
 	if (auto address = md::getVirtualAddress(function))
 	{
-		cout << " [" << hex << setfill('0') << setw(info.getPointerSize() * 2) << address->getLimitedValue() << ']';
+		int width = static_cast<int>(info.getPointerSize() * 2);
+		cout << " [" << hex << setfill('0') << setw(width) << address->getLimitedValue() << ']';
 	}
 	cout << " needs register use information." << endl;
 	

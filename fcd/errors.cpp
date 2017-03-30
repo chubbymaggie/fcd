@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "errors.h"
@@ -38,10 +26,12 @@ namespace
 		ERROR_MESSAGE(Main_EntryPointOutOfMappedMemory, "additional entry address points outside of executable"),
 		ERROR_MESSAGE(Main_NoEntryPoint, "no entry point (see --help)"),
 		ERROR_MESSAGE(Main_DecompilationError, "decompiler error"),
+		ERROR_MESSAGE(Main_HeaderParsingError, "header file parsing error"),
 		
 		ERROR_MESSAGE(Python_LoadError, "couldn't load Python script"),
 		ERROR_MESSAGE(Python_InvalidPassFunction, "run function should accept a single argument"),
 		ERROR_MESSAGE(Python_PassTypeConfusion, "Python pass must declare exactly one of runOnFunction or runOnModule"),
+		ERROR_MESSAGE(Python_ExecutableScriptInitializationError, "Python script failed to initialize correctly"),
 	};
 	
 	static_assert(countof(errorMessages) == static_cast<size_t>(FcdError::MaxError), "missing error strings");

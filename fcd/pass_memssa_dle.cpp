@@ -3,28 +3,14 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "passes.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/IR/PatternMatch.h>
-SILENCE_LLVM_WARNINGS_END()
 
 using namespace llvm;
 using namespace std;
@@ -39,7 +25,7 @@ namespace
 		{
 		}
 		
-		virtual const char* getPassName() const override
+		virtual StringRef getPassName() const override
 		{
 			return "Dead Load Elimination";
 		}
@@ -59,22 +45,29 @@ namespace
 			{
 				for (const MemoryAccess& access : *accessList)
 				{
-					if (auto use = dyn_cast<MemoryUse>(&access))
-					if (auto load = dyn_cast<LoadInst>(use->getMemoryInst()))
+					if (auto useOrDef = dyn_cast<MemoryUseOrDef>(&access))
 					{
-						auto parent = access.getDefiningAccess();
-						if (isa<MemoryDef>(parent))
-						if (auto store = dyn_cast_or_null<StoreInst>(parent->getMemoryInst()))
+						if (auto use = dyn_cast<MemoryUse>(&access))
+						if (auto load = dyn_cast<LoadInst>(use->getMemoryInst()))
 						{
-							auto storedValue = store->getValueOperand();
-							// sanity test
-							if (storedValue->getType() == load->getType())
+							auto parent = useOrDef->getDefiningAccess();
+							if (auto def = dyn_cast<MemoryDef>(parent))
+							if (auto store = dyn_cast_or_null<StoreInst>(def->getMemoryInst()))
 							{
-								load->replaceAllUsesWith(storedValue);
-								deletedLoads.push_back(load);
-								changed = true;
+								auto storedValue = store->getValueOperand();
+								// sanity test
+								if (storedValue->getType() == load->getType())
+								{
+									load->replaceAllUsesWith(storedValue);
+									deletedLoads.push_back(load);
+									changed = true;
+								}
 							}
 						}
+					}
+					else
+					{
+						break;
 					}
 				}
 			}
@@ -92,10 +85,10 @@ namespace
 		
 		virtual bool runOnFunction(Function& f) override
 		{
-			MemorySSA mssa(f);
 			auto& aaResults = getAnalysis<AAResultsWrapperPass>().getAAResults();
 			auto& domTree = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-			mssa.buildMemorySSA(&aaResults, &domTree);
+			MemorySSA mssa(f, &aaResults, &domTree);
+			
 			bool changed = false;
 			for (BasicBlock* bb : ReversePostOrderTraversal<BasicBlock*>(&f.getEntryBlock()))
 			{
@@ -108,9 +101,4 @@ namespace
 	char MemorySSADLE::ID = 0;
 	
 	RegisterPass<MemorySSADLE> memSsaDle("memssadle", "MemorySSA-based dead load elimination");
-}
-
-FunctionPass* createMemorySSADeadLoadEliminationPass()
-{
-	return new MemorySSADLE;
 }

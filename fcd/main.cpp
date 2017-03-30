@@ -3,29 +3,22 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-//
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
+#include "ast_passes.h"
 #include "command_line.h"
-#include "llvm_warnings.h"
+#include "errors.h"
+#include "executable.h"
+#include "header_decls.h"
 #include "main.h"
 #include "metadata.h"
+#include "passes.h"
+#include "python_context.h"
 #include "params_registry.h"
+#include "translation_context.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/BasicAliasAnalysis.h>
 #include <llvm/Analysis/Passes.h>
@@ -44,26 +37,28 @@ SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/Scalar.h>
-SILENCE_LLVM_WARNINGS_END()
+#include <llvm/Transforms/Scalar/GVN.h>
 
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "ast_passes.h"
-#include "errors.h"
-#include "executable.h"
-#include "passes.h"
-#include "pass_python.h"
-#include "translation_context.h"
-
 using namespace llvm;
 using namespace std;
+
+#ifdef FCD_DEBUG
+[[gnu::used]]
+raw_ostream& llvm_errs()
+{
+	return errs();
+}
+#endif
 
 namespace
 {
@@ -75,6 +70,10 @@ namespace
 	
 	cl::list<string> additionalPasses("opt", cl::desc("Insert LLVM optimization pass; a pass name ending in .py is interpreted as a Python script. Requires default pass pipeline."), whitelist());
 	cl::opt<string> customPassPipeline("opt-pipeline", cl::desc("Customize pass pipeline. Empty string lets you order passes through $EDITOR; otherwise, must be a whitespace-separated list of passes."), cl::init("default"), whitelist());
+	
+	cl::list<string> headers("header", cl::desc("Path of a header file to parse for function declarations. Can be specified multiple times"), whitelist());
+	cl::list<string> frameworks("framework", cl::desc("Path of an Apple framework that fcd should use for declarations. Can be specified multiple times"), whitelist());
+	cl::list<string> headerSearchPath("I", cl::desc("Additional directory to search headers in. Can be specified multiple times"), whitelist());
 	
 	cl::alias additionalEntryPointsAlias("e", cl::desc("Alias for --other-entry"), cl::aliasopt(additionalEntryPoints), whitelist());
 	cl::alias partialDisassemblyAlias("p", cl::desc("Alias for --partial"), cl::aliasopt(partialDisassembly), whitelist());
@@ -158,7 +157,7 @@ namespace
 		return count;
 	}
 	
-	bool refillEntryPoints(const TranslationContext& transl, const Executable& executable, unordered_map<uint64_t, SymbolInfo>& toVisit, size_t iterations)
+	bool refillEntryPoints(const TranslationContext& transl, const EntryPointRepository& entryPoints, map<uint64_t, SymbolInfo>& toVisit, size_t iterations)
 	{
 		if (isExclusiveDisassembly() || (isPartialDisassembly() && iterations > 1))
 		{
@@ -167,7 +166,7 @@ namespace
 		
 		for (uint64_t entryPoint : transl.getDiscoveredEntryPoints())
 		{
-			if (auto symbolInfo = executable.getInfo(entryPoint))
+			if (auto symbolInfo = entryPoints.getInfo(entryPoint))
 			{
 				toVisit.insert({entryPoint, *symbolInfo});
 			}
@@ -180,7 +179,7 @@ namespace
 		int argc;
 		char** argv;
 	
-		LLVMContext& llvm;
+		LLVMContext llvm;
 		PythonContext python;
 		vector<Pass*> optimizeAndTransformPasses;
 		
@@ -356,8 +355,10 @@ namespace
 	
 	public:
 		Main(int argc, char** argv)
-		: argc(argc), argv(argv), llvm(getGlobalContext()), python(argv[0])
+		: argc(argc), argv(argv), python(argv[0])
 		{
+			(void) argc;
+			(void) this->argc;
 		}
 	
 		string getProgramName() { return sys::path::stem(argv[0]); }
@@ -373,25 +374,43 @@ namespace
 		ErrorOr<unique_ptr<Module>> generateAnnotatedModule(Executable& executable, const string& moduleName = "fcd-out")
 		{
 			x86_config config64 = { x86_isa64, 8, X86_REG_RIP, X86_REG_RSP, X86_REG_RBP };
-			TranslationContext transl(llvm, config64, moduleName);
-	
-			unordered_map<uint64_t, SymbolInfo> toVisit;
-			for (uint64_t address : executable.getVisibleEntryPoints())
+			TranslationContext transl(llvm, executable, config64, moduleName);
+			
+			// Load headers here, since this is the earliest point where we have an executable and a module.
+			auto cDecls = HeaderDeclarations::create(
+				transl.get(),
+				headerSearchPath.begin(),
+				headerSearchPath.end(),
+				headers.begin(),
+				headers.end(),
+				frameworks.begin(),
+				frameworks.end(),
+				errs());
+			if (!cDecls)
 			{
-				auto symbolInfo = executable.getInfo(address);
-				// Entry points are always considered when naming symbols, but only used in full disassembly mode.
-				// Otherwise, we expect symbols to be specified with the command line.
-				if (isFullDisassembly())
+				return make_error_code(FcdError::Main_HeaderParsingError);
+			}
+			
+			EntryPointRepository entryPoints;
+			entryPoints.addProvider(executable);
+			entryPoints.addProvider(*cDecls);
+			
+			md::addIncludedFiles(transl.get(), cDecls->getIncludedFiles());
+	
+			map<uint64_t, SymbolInfo> toVisit;
+			if (isFullDisassembly())
+			{
+				for (uint64_t address : entryPoints.getVisibleEntryPoints())
 				{
+					auto symbolInfo = entryPoints.getInfo(address);
 					assert(symbolInfo != nullptr);
 					toVisit.insert({symbolInfo->virtualAddress, *symbolInfo});
 				}
 			}
 	
-			unordered_set<uint64_t> entryPoints(additionalEntryPoints.begin(), additionalEntryPoints.end());
-			for (uint64_t address : entryPoints)
+			for (uint64_t address : unordered_set<uint64_t>(additionalEntryPoints.begin(), additionalEntryPoints.end()))
 			{
-				if (auto symbolInfo = executable.getInfo(address))
+				if (auto symbolInfo = entryPoints.getInfo(address))
 				{
 					toVisit.insert({symbolInfo->virtualAddress, *symbolInfo});
 				}
@@ -420,50 +439,46 @@ namespace
 						transl.setFunctionName(functionInfo.virtualAddress, functionInfo.name);
 					}
 					
-					Function* fn = transl.createFunction(executable, functionInfo.virtualAddress);
-					// Couldn't decompile, abort
-					if (fn == nullptr)
+					if (Function* fn = transl.createFunction(functionInfo.virtualAddress))
 					{
+						if (Function* cFunction = cDecls->prototypeForAddress(functionInfo.virtualAddress))
+						{
+							md::setFinalPrototype(*fn, *cFunction);
+						}
+					}
+					else
+					{
+						// Couldn't decompile, abort
 						return make_error_code(FcdError::Main_DecompilationError);
 					}
 				}
 				iterations++;
 			}
-			while (refillEntryPoints(transl, executable, toVisit, iterations));
+			while (refillEntryPoints(transl, entryPoints, toVisit, iterations));
 	
 			// Perform early optimizations to make the module suitable for analysis
 			auto module = transl.take();
 			legacy::PassManager phaseOne = createBasePassManager();
 			phaseOne.add(createExternalAAWrapperPass(&Main::aliasAnalysisHooks));
 			phaseOne.add(createDeadCodeEliminationPass());
-			phaseOne.add(createCFGSimplificationPass());
 			phaseOne.add(createInstructionCombiningPass());
 			phaseOne.add(createRegisterPointerPromotionPass());
 			phaseOne.add(createGVNPass());
 			phaseOne.add(createDeadStoreEliminationPass());
 			phaseOne.add(createInstructionCombiningPass());
-			phaseOne.add(createCFGSimplificationPass());
 			phaseOne.add(createGlobalDCEPass());
 			phaseOne.run(*module);
 	
 			// Annotate stubs before returning module
-			annotateStubs(executable, *module);
-			return move(module);
-		}
-
-		void annotateStubs(Executable& executable, Module& module)
-		{
-			Function* jumpIntrin = module.getFunction("x86_jump_intrin");
-
-			// This may eventually need to be moved to a pass of its own or something.
+			Function* jumpIntrin = module->getFunction("x86_jump_intrin");
 			vector<Function*> functions;
-			for (Function& fn : module.getFunctionList())
+			for (Function& fn : module->getFunctionList())
 			{
 				if (md::isPrototype(fn))
 				{
 					continue;
 				}
-	
+				
 				BasicBlock& entry = fn.getEntryBlock();
 				auto terminator = entry.getTerminator();
 				if (isa<UnreachableInst>(terminator))
@@ -477,65 +492,23 @@ namespace
 						if (auto int2ptr = dyn_cast<IntToPtrInst>(inst.get()))
 						{
 							auto value = cast<ConstantInt>(int2ptr->getOperand(0));
-							auto intValue = value->getLimitedValue();
-							if (const string* stubTarget = executable.getStubTarget(intValue))
+							if (const StubInfo* stubTarget = executable.getStubTarget(value->getLimitedValue()))
 							{
-								md::setImportName(fn, *stubTarget);
-								fn.setName(*stubTarget);
+								if (Function* cFunction = cDecls->prototypeForImportName(stubTarget->name))
+								{
+									md::setIsStub(fn);
+									md::setFinalPrototype(fn, *cFunction);
+								}
+								
+								// If we identified no function from the header file, this gives the import its real
+								// name. Otherwise, it'll prefix the name with some number.
+								fn.setName(stubTarget->name);
 							}
 						}
 					}
 				}
 			}
-		}
-
-		bool preoptimizeModule(Module& module, raw_ostream& errorOutput, Executable* executable = nullptr)
-		{
-			// Do we still have instances of the unimplemented intrinsic? Bail out here if so.
-			size_t errorCount = 0;
-			if (Function* unimplemented = module.getFunction("x86_unimplemented"))
-			{
-				errorCount += forEachCall(unimplemented, 1, [](const string& message) {
-					cerr << "translation for instruction '" << message << "' is missing" << endl;
-				});
-			}
-	
-			if (Function* assertionFailure = module.getFunction("x86_assertion_failure"))
-			{
-				errorCount += forEachCall(assertionFailure, 0, [](const string& message) {
-					cerr << "translation assertion failure: " << message << endl;
-				});
-			}
-	
-			if (errorCount > 0)
-			{
-				cerr << "incorrect or missing translations; cannot decompile" << endl;
-				return false;
-			}
-	
-			// Pre-optimize the module before running the customizable pipeline.
-			for (int i = 0; i < 2; i++)
-			{
-				auto phaseTwo = createBasePassManager();
-				phaseTwo.add(new ExecutableWrapper(executable));
-				phaseTwo.add(createParameterRegistryPass());
-				phaseTwo.add(createExternalAAWrapperPass(&Main::aliasAnalysisHooks));
-				phaseTwo.add(createConditionSimplificationPass());
-				phaseTwo.add(createGVNPass());
-				phaseTwo.add(createDeadStoreEliminationPass());
-				phaseTwo.add(createInstructionCombiningPass());
-				phaseTwo.add(createCFGSimplificationPass());
-				phaseTwo.run(module);
-		
-#if DEBUG
-				if (verifyModule(module, &errorOutput))
-				{
-					// errors!
-					return false;
-				}
-#endif
-			}
-			return true;
+			return move(module);
 		}
 		
 		bool optimizeAndTransformModule(Module& module, raw_ostream& errorOutput, Executable* executable = nullptr)
@@ -551,7 +524,7 @@ namespace
 			}
 			passManager.run(module);
 	
-#ifdef DEBUG
+#ifdef FCD_DEBUG
 			if (verifyModule(module, &errorOutput))
 			{
 				// errors!
@@ -570,13 +543,10 @@ namespace
 			backend->addPass(new AstRemoveUndef);
 			backend->addPass(new AstBranchCombine);
 			backend->addPass(new AstSimplifyExpressions);
-			backend->addPass(new AstPrint(output));
-	
-			legacy::PassManager outputPhase;
-			outputPhase.add(createSESELoopPass());
-			outputPhase.add(createEarlyCSEPass()); // EarlyCSE eliminates redundant PHI nodes
-			outputPhase.add(backend);
-			outputPhase.run(module);
+			backend->addPass(new AstMergeCongruentVariables);
+			backend->addPass(new AstBranchCombine);
+			backend->addPass(new AstPrint(output, md::getIncludedFiles(module)));
+			backend->runOnModule(module);
 			return true;
 		}
 	
@@ -591,14 +561,8 @@ namespace
 			initializeInstCombine(pr);
 			initializeScalarOpts(pr);
 		
-			// TODO: remove when MemorySSA goes mainstream
-			initializeMemorySSAPrinterPassPass(pr);
-			initializeMemorySSALazyPass(pr);
-		
 			initializeParameterRegistryPass(pr);
 			initializeArgumentRecoveryPass(pr);
-			initializeAstBackEndPass(pr);
-			initializeSESELoopPass(pr);
 		}
 		
 		bool prepareOptimizationPasses()
@@ -608,12 +572,13 @@ namespace
 				"globaldce",
 				"fixindirects",
 				"argrec",
-				"modulethinner",
+				"sroa",
+				"intnarrowing",
 				"signext",
+				"instcombine",
+				"intops",
 				"simplifyconditions",
 				// <-- custom passes go here with the default pass pipeline
-				"instcombine",
-				"sroa",
 				"instcombine",
 				"gvn",
 				"simplifycfg",
@@ -645,9 +610,9 @@ namespace
 			}
 			else if (customPassPipeline == "")
 			{
-				if (auto editor = sys::Process::GetEnv("EDITOR"))
+				if (auto editor = getenv("EDITOR"))
 				{
-					optimizeAndTransformPasses = interactivelyEditPassPipeline(editor.getValue(), passNames);
+					optimizeAndTransformPasses = interactivelyEditPassPipeline(editor, passNames);
 				}
 				else
 				{
@@ -715,6 +680,7 @@ int main(int argc, char** argv)
 	unique_ptr<Module> module;
 	
 	// step one: create annotated module from executable (or load it from .ll)
+	ErrorOr<unique_ptr<MemoryBuffer>> bufferOrError(nullptr);
 	if (moduleInCount())
 	{
 		SMDiagnostic errors;
@@ -727,7 +693,7 @@ int main(int argc, char** argv)
 	}
 	else
 	{
-		auto bufferOrError = MemoryBuffer::getFile(inputFile, -1, false);
+		bufferOrError = MemoryBuffer::getFile(inputFile, -1, false);
 		if (!bufferOrError)
 		{
 			cerr << program << ": can't open " << inputFile << ": " << errorOf(bufferOrError) << endl;
@@ -753,6 +719,21 @@ int main(int argc, char** argv)
 		module = move(moduleOrError.get());
 	}
 	
+	// Make sure that the module is legal
+	size_t errorCount = 0;
+	if (Function* assertionFailure = module->getFunction("x86_assertion_failure"))
+	{
+		errorCount += forEachCall(assertionFailure, 0, [](const string& message) {
+			cerr << "translation assertion failure: " << message << endl;
+		});
+	}
+	
+	if (errorCount > 0)
+	{
+		cerr << "incorrect or missing translations; cannot decompile" << endl;
+		return 1;
+	}
+	
 	// if we want module output, this is where we stop
 	if (moduleOutCount() == 1)
 	{
@@ -762,28 +743,13 @@ int main(int argc, char** argv)
 	
 	if (moduleInCount() < 2)
 	{
-		// step two: pe-optimize module
-		if (!mainObj.preoptimizeModule(*module, errs(), executable.get()))
-		{
-			return 1;
-		}
-	}
-	
-	if (moduleOutCount() == 2)
-	{
-		module->print(outs(), nullptr);
-		return 0;
-	}
-	
-	if (moduleInCount() < 3)
-	{
 		if (!mainObj.optimizeAndTransformModule(*module, errs(), executable.get()))
 		{
 			return 1;
 		}
 	}
 	
-	if (moduleOutCount() > 2)
+	if (moduleOutCount() > 1)
 	{
 		module->print(outs(), nullptr);
 		return 0;

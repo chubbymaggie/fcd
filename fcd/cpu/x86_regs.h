@@ -3,27 +3,15 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef x86_regs_h
 #define x86_regs_h
 
 #include <cstdint>
-#include <x86.h> // capstone/x86.h
+#include <capstone/x86.h>
 
 union x86_word_reg {
 	uint16_t word;
@@ -67,6 +55,7 @@ struct x86_flags_reg {
 	bool zf; // zero: set if operation result is 0
 	bool sf; // sign: set if most significant bit of result is 1
 	bool of; // overflow: set when the result has a sign different from the expected one (carry into ^ carry out)
+	bool df; // direction: controls increment/decrement of D register after string instructions
 	
 	// control/system flags
 	/*

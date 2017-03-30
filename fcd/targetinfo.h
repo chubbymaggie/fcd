@@ -3,32 +3,18 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__targetinfo_h
 #define fcd__targetinfo_h
 
-#include "llvm_warnings.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Instructions.h>
-SILENCE_LLVM_WARNINGS_END()
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,6 +22,7 @@ SILENCE_LLVM_WARNINGS_END()
 struct TargetRegisterInfo
 {
 	size_t offset;
+	size_t subOffset;
 	size_t size;
 	llvm::SmallVector<unsigned, 4> gepOffsets;
 	std::string name;
@@ -48,10 +35,9 @@ class TargetInfo
 	size_t spIndex;
 	const std::vector<TargetRegisterInfo>* targetRegInfo;
 	const llvm::DataLayout* dl;
-	llvm::Type* registerStruct;
 	
 	TargetInfo()
-	: spIndex(0xffffffff), targetRegInfo(nullptr), dl(nullptr), registerStruct(nullptr)
+	: spIndex(std::numeric_limits<size_t>::max()), targetRegInfo(nullptr), dl(nullptr)
 	{
 	}
 
@@ -64,9 +50,9 @@ public:
 		return *targetRegInfo;
 	}
 	
-	inline void setTargetRegisterInfo(const std::vector<TargetRegisterInfo>& targetRegInfo)
+	inline void setTargetRegisterInfo(const std::vector<TargetRegisterInfo>& targetRegInfos)
 	{
-		this->targetRegInfo = &targetRegInfo;
+		this->targetRegInfo = &targetRegInfos;
 	}
 	
 	inline std::string& targetName()
@@ -84,11 +70,11 @@ public:
 		return dl->getPointerSize();
 	}
 	
-	inline const TargetRegisterInfo* registerNamed(const char* name) const
+	inline const TargetRegisterInfo* registerNamed(const char* regname) const
 	{
 		for (const auto& regInfo : targetRegisterInfo())
 		{
-			if (regInfo.name == name)
+			if (regInfo.name == regname)
 			{
 				return &regInfo;
 			}
@@ -96,13 +82,13 @@ public:
 		return nullptr;
 	}
 	
-	llvm::GetElementPtrInst* getRegister(llvm::Value* registerStruct, const TargetRegisterInfo& info) const;
+	llvm::Instruction* getRegister(llvm::Value* registerStruct, const TargetRegisterInfo& info, llvm::Instruction& insertionPoint) const;
 	
 	const TargetRegisterInfo* registerInfo(unsigned registerId) const;
 	const TargetRegisterInfo* registerInfo(const llvm::Value& value) const;
 	const TargetRegisterInfo* registerInfo(const llvm::GetElementPtrInst& value) const;
 	const TargetRegisterInfo* registerInfo(size_t offset, size_t size) const;
-	const TargetRegisterInfo* largestOverlappingRegister(const TargetRegisterInfo& overlapped) const;
+	const TargetRegisterInfo& largestOverlappingRegister(const TargetRegisterInfo& overlapped) const;
 	
 	inline void setStackPointer(const TargetRegisterInfo& targetReg)
 	{

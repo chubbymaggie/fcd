@@ -3,12 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd. fcd as a whole is licensed under the terms
-// of the GNU GPLv3 license, but specific parts (such as this one) are
-// dual-licensed under the terms of a BSD-like license as well. You
-// may use, modify and distribute this part of fcd under the terms of
-// either license, at your choice. See the LICENSE file in this directory
-// for details.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "command_line.h"
@@ -20,11 +16,18 @@ using namespace std;
 
 namespace
 {
-	cl::opt<uint64_t> flatOrigin("flat-org", cl::desc("Load address of binary (--format=flat)"), whitelist());
+	cl::opt<unsigned long long> flatOrigin("flat-org", cl::desc("Load address of binary (--format=flat)"), whitelist());
 	
-	class FlatBinary : public Executable
+	class FlatBinary final : public Executable
 	{
 		uint64_t baseAddress;
+		
+	protected:
+		virtual string doGetTargetTriple() const override
+		{
+			// Replace x86_64 with a flat-arch option the day that we will support more architectures.
+			return "x86_64-unknown-";
+		}
 		
 	public:
 		FlatBinary(const uint8_t* begin, const uint8_t* end, uint64_t baseAddress)
@@ -39,7 +42,7 @@ namespace
 		
 		virtual const uint8_t* map(uint64_t address) const override
 		{
-			size_t size = end() - begin();
+			auto size = static_cast<size_t>(end() - begin());
 			if (address >= baseAddress && address < baseAddress + size)
 			{
 				return begin() + (address - baseAddress);
@@ -47,15 +50,20 @@ namespace
 			return nullptr;
 		}
 		
-		virtual const std::string* doGetStubTarget(uint64_t address) const override
+		virtual StubTargetQueryResult doGetStubTarget(uint64_t address, string& libraryName, string& into) const override
 		{
-			return nullptr;
+			return Unresolved;
 		}
 	};
 }
 
-ErrorOr<unique_ptr<Executable>> parseFlatBinary(const uint8_t* begin, const uint8_t* end)
+FlatBinaryExecutableFactory::FlatBinaryExecutableFactory()
+: ExecutableFactory("flat", "flat binary")
 {
-	unique_ptr<Executable> executable = make_unique<FlatBinary>(begin, end, flatOrigin);
+}
+
+ErrorOr<unique_ptr<Executable>> FlatBinaryExecutableFactory::parse(const uint8_t* begin, const uint8_t* end)
+{
+	auto executable = std::make_unique<FlatBinary>(begin, end, flatOrigin);
 	return move(executable);
 }

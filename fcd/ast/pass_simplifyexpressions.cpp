@@ -3,24 +3,14 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
-#include "pass_simplifyexpressions.h"
+#include "ast_passes.h"
 #include "visitor.h"
+
+#include <unordered_set>
 
 using namespace llvm;
 using namespace std;
@@ -57,8 +47,9 @@ namespace
 	class ExpressionSimplifierVisitor : public AstVisitor<ExpressionSimplifierVisitor, false>
 	{
 		AstContext& ctx;
+		std::unordered_set<const ExpressionUser*> visitedExpressions;
 		
-		void collectExpressionTerms(NAryOperatorExpression& baseExpression, SmallPtrSetImpl<Expression*>& trueTerms, SmallPtrSetImpl<Expression*>& falseTerms)
+		void collectExpressionTerms(NAryOperatorExpression& baseExpression, SmallVectorImpl<Expression*>& trueTerms, SmallVectorImpl<Expression*>& falseTerms)
 		{
 			for (ExpressionUse& use : baseExpression.operands())
 			{
@@ -73,7 +64,11 @@ namespace
 				}
 				
 				auto isNegated = countNegationDepth(*expr);
-				(isNegated.second ? falseTerms : trueTerms).insert(isNegated.first);
+				auto& terms = isNegated.second ? falseTerms : trueTerms;
+				if (find(terms.begin(), terms.end(), isNegated.first) == terms.end())
+				{
+					terms.push_back(isNegated.first);
+				}
 			}
 		}
 		
@@ -85,34 +80,38 @@ namespace
 			}
 			
 			// This is allowed on both && and ||, since (a && a) == a and (a || a) == a.
-			SmallPtrSet<Expression*, 16> trueTerms;
-			SmallPtrSet<Expression*, 16> falseTerms;
+			SmallVector<Expression*, 16> trueTerms;
+			SmallVector<Expression*, 16> falseTerms;
 			collectExpressionTerms(nary, trueTerms, falseTerms);
 			
 			auto trueExpression = ctx.expressionForTrue();
+			auto falseExpression = ctx.expressionForFalse();
 			SmallVector<Expression*, 16> expressions;
 			for (Expression* falseTerm : falseTerms)
 			{
-				if (trueTerms.count(falseTerm) != 0)
+				if (find(trueTerms.begin(), trueTerms.end(), falseTerm) != trueTerms.end())
 				{
 					// this will either be a totaulogy or a contradiction depending on the logical operator
-					auto trueValue = ctx.expressionForTrue();
-					return nary.getType() == NAryOperatorExpression::ShortCircuitOr ? trueValue : ctx.negate(trueValue);
+					return nary.getType() == NAryOperatorExpression::ShortCircuitOr ? trueExpression : falseExpression;
 				}
 				
 				if (falseTerm == trueExpression)
 				{
-					// contains a !true (== false)
 					if (nary.getType() == NAryOperatorExpression::ShortCircuitAnd)
 					{
-						// Expression dominated
-						return ctx.negate(falseTerm);
+						return falseExpression;
 					}
-					// do not insert then, since it has no effect
+				}
+				else if (falseTerm == falseExpression)
+				{
+					if (nary.getType() == NAryOperatorExpression::ShortCircuitOr)
+					{
+						return trueExpression;
+					}
 				}
 				else
 				{
-					expressions.push_back(falseTerm);
+					expressions.push_back(ctx.negate(falseTerm));
 				}
 			}
 			
@@ -122,7 +121,14 @@ namespace
 				{
 					if (nary.getType() == NAryOperatorExpression::ShortCircuitOr)
 					{
-						return trueTerm;
+						return trueExpression;
+					}
+				}
+				else if (trueTerm == falseExpression)
+				{
+					if (nary.getType() == NAryOperatorExpression::ShortCircuitAnd)
+					{
+						return falseExpression;
 					}
 				}
 				else
@@ -131,14 +137,7 @@ namespace
 				}
 			}
 			
-			unsigned i = 0;
-			auto result = ctx.nary(nary.getType(), static_cast<unsigned>(expressions.size()));
-			for (Expression* expression : expressions)
-			{
-				result->setOperand(i, expression);
-				++i;
-			}
-			return result;
+			return ctx.nary(nary.getType(), expressions.begin(), expressions.end());
 		}
 		
 	public:
@@ -157,6 +156,7 @@ namespace
 				if (auto innerNegate = match(operand, UnaryOperatorExpression::LogicalNegate))
 				{
 					unary.replaceAllUsesWith(innerNegate->getOperand());
+					unary.dropAllReferences();
 				}
 				else if (auto innerNary = dyn_cast<NAryOperatorExpression>(operand))
 				{
@@ -166,6 +166,7 @@ namespace
 						auto flippedOp = static_cast<NAryOperatorExpression::NAryOperatorType>(op ^ 1);
 						auto replacement = ctx.nary(flippedOp, innerNary->getOperand(0), innerNary->getOperand(1));
 						unary.replaceAllUsesWith(replacement);
+						unary.dropAllReferences();
 					}
 				}
 			}
@@ -174,19 +175,43 @@ namespace
 				if (auto innerAddressOf = match(operand, UnaryOperatorExpression::AddressOf))
 				{
 					unary.replaceAllUsesWith(innerAddressOf->getOperand());
+					unary.dropAllReferences();
 				}
 			}
 		}
 		
 		void visitNAryOperator(NAryOperatorExpression& nary)
 		{
+			ExpressionReference naryRef = &nary;
+			
 			// Negation distribution kills term collection, so do that first before visiting child nodes
 			Expression* result = removeIdenticalTerms(nary);
 			for (ExpressionUse& use : result->operands())
 			{
 				visit(*use.getUse());
 			}
-			nary.replaceAllUsesWith(result);
+			
+			if (result != &nary)
+			{
+				bool needsRevisiting = result == ctx.expressionForTrue() || result == ctx.expressionForFalse();
+				while (!nary.uses_empty())
+				{
+					auto& front = *nary.uses_begin();
+					front.setUse(result);
+					
+					// Re-visit expressions if we detected a tautology/contradiction.
+					if (needsRevisiting)
+					{
+						auto user = front.getUser();
+						if (isa<Expression>(user) && visitedExpressions.erase(user))
+						{
+							visit(*user);
+						}
+					}
+				}
+				
+				nary.dropAllReferences();
+			}
 		}
 		
 		void visitMemberAccess(MemberAccessExpression& memberAccess)
@@ -233,6 +258,7 @@ namespace
 			if (constantIndex->ui64 == 0)
 			{
 				subscript.replaceAllUsesWith(addressOf->getOperand());
+				subscript.dropAllReferences();
 			}
 		}
 		
@@ -252,6 +278,15 @@ namespace
 		{
 		}
 		
+		void visit(ExpressionUser& user)
+		{
+			auto result = visitedExpressions.insert(&user);
+			if (result.second)
+			{
+				AstVisitor<ExpressionSimplifierVisitor, false>::visit(user);
+			}
+		}
+		
 		void visitDefault(ExpressionUser& user)
 		{
 			llvm_unreachable("unimplemented expression simplification case");
@@ -268,32 +303,26 @@ namespace
 		{
 		}
 		
-		void visitNoop(NoopStatement& noop)
-		{
-		}
-		
-		void visitSequence(SequenceStatement& sequence)
-		{
-			for (Statement* statement : sequence)
-			{
-				visit(*statement);
-			}
-		}
-		
 		void visitIfElse(IfElseStatement& ifElse)
 		{
 			exprVisitor.visit(*ifElse.getCondition());
-			visit(*ifElse.getIfBody());
-			if (auto elseBody = ifElse.getElseBody())
+			for (Statement* stmt : ifElse.getIfBody())
 			{
-				visit(*elseBody);
+				visit(*stmt);
+			}
+			for (Statement* stmt : ifElse.getElseBody())
+			{
+				visit(*stmt);
 			}
 		}
 		
 		void visitLoop(LoopStatement& loop)
 		{
 			exprVisitor.visit(*loop.getCondition());
-			visit(*loop.getLoopBody());
+			for (Statement* stmt : loop.getLoopBody())
+			{
+				visit(*stmt);
+			}
 		}
 		
 		void visitKeyword(KeywordStatement& keyword)
@@ -321,7 +350,8 @@ namespace
 
 void AstSimplifyExpressions::doRun(FunctionNode &fn)
 {
-	StatementSimplifierVisitor(fn.getContext()).visit(*fn.getBody());
+	StatementSimplifierVisitor visitor(fn.getContext());
+	visitAll(visitor, fn.getBody());
 }
 
 const char* AstSimplifyExpressions::getName() const

@@ -3,37 +3,22 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
-#include "llvm_warnings.h"
 #include "metadata.h"
 #include "not_null.h"
 #include "params_registry.h"
 #include "translation_context.h"
 #include "x86_register_map.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/ADT/Triple.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils/Cloning.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <array>
 #include <unordered_set>
@@ -70,9 +55,9 @@ namespace
 		for (size_t i = 0; i < detail.regs_read_count; ++i)
 		{
 			if (auto registerInfo = target.registerInfo(detail.regs_read[i]))
-			if (auto largest = target.largestOverlappingRegister(*registerInfo))
 			{
-				result.addParameter(ValueInformation::IntegerRegister, largest);
+				const auto& largest = target.largestOverlappingRegister(*registerInfo);
+				result.addParameter(ValueInformation::IntegerRegister, &largest);
 			}
 		}
 		
@@ -80,9 +65,9 @@ namespace
 		for (size_t i = 0; i < detail.regs_write_count; ++i)
 		{
 			if (auto registerInfo = target.registerInfo(detail.regs_write[i]))
-			if (auto largest = target.largestOverlappingRegister(*registerInfo))
 			{
-				result.addReturn(ValueInformation::IntegerRegister, largest);
+				const auto& largest = target.largestOverlappingRegister(*registerInfo);
+				result.addReturn(ValueInformation::IntegerRegister, &largest);
 			}
 		}
 		
@@ -97,11 +82,14 @@ namespace
 		Type* integer = Type::getIntNTy(ctx, targetInfo.getPointerSize() * CHAR_BIT);
 		CallInformation info = infoForInstruction(targetInfo, inst);
 		
+		// Temporary insertion point. Kind of a hack.
+		auto insertionPoint = new UnreachableInst(ctx, &insertInto);
+		
 		// Create a return type structure
 		StructType* returnType = StructType::create(module.getContext(), string(inst.mnemonic) + ".return");
 		// XXX: this assumes that we only deal with integer registers (which may have to be updated shortly)
 		
-		unordered_map<unsigned, GetElementPtrInst*> gepsForRegister;
+		unordered_map<unsigned, Instruction*> gepsForRegister;
 		
 		size_t i = 0;
 		vector<Type*> structBody(info.returns_size());
@@ -110,11 +98,10 @@ namespace
 			assert(value.type == ValueInformation::IntegerRegister);
 			structBody[i] = integer;
 			
-			GetElementPtrInst*& gep = gepsForRegister[value.registerInfo->registerId];
+			Instruction*& gep = gepsForRegister[value.registerInfo->registerId];
 			if (gep == nullptr)
 			{
-				gep = targetInfo.getRegister(registerStruct, *value.registerInfo);
-				insertInto.getInstList().push_back(gep);
+				gep = targetInfo.getRegister(registerStruct, *value.registerInfo, *insertionPoint);
 			}
 			++i;
 		}
@@ -131,14 +118,15 @@ namespace
 			assert(value.type == ValueInformation::IntegerRegister);
 			parameters[i] = integer;
 			
-			GetElementPtrInst*& gep = gepsForRegister[value.registerInfo->registerId];
+			Instruction*& gep = gepsForRegister[value.registerInfo->registerId];
 			if (gep == nullptr)
 			{
-				gep = targetInfo.getRegister(registerStruct, *value.registerInfo);
-				insertInto.getInstList().push_back(gep);
+				gep = targetInfo.getRegister(registerStruct, *value.registerInfo, *insertionPoint);
 			}
 			++i;
 		}
+		
+		insertionPoint->eraseFromParent();
 		
 		string disassembly;
 		raw_string_ostream(disassembly) << inst.mnemonic << ' ' << inst.op_str;
@@ -172,8 +160,9 @@ namespace
 	}
 }
 
-TranslationContext::TranslationContext(LLVMContext& context, const x86_config& config, const std::string& module_name)
+TranslationContext::TranslationContext(LLVMContext& context, Executable& executable, const x86_config& config, const std::string& module_name)
 : context(context)
+, executable(executable)
 , module(new Module(module_name, context))
 {
 	if (auto generator = CodeGenerator::x86(context))
@@ -188,7 +177,8 @@ TranslationContext::TranslationContext(LLVMContext& context, const x86_config& c
 		abort();
 	}
 	
-	if (auto csHandle = capstone::create(CS_ARCH_X86, CS_MODE_LITTLE_ENDIAN | cs_size_mode(config.address_size)))
+	auto options = static_cast<unsigned>(CS_MODE_LITTLE_ENDIAN | cs_size_mode(config.address_size));
+	if (auto csHandle = capstone::create(CS_ARCH_X86, options))
 	{
 		cs.reset(new capstone(move(csHandle.get())));
 	}
@@ -215,6 +205,13 @@ TranslationContext::TranslationContext(LLVMContext& context, const x86_config& c
 	configVariable = new GlobalVariable(*module, configTy, true, GlobalVariable::PrivateLinkage, configConstant, "config");
 	
 	string dataLayout;
+	Triple triple(executable.getTargetTriple());
+	
+	if (triple.getOS() == Triple::Linux)
+	{
+		dataLayout += "m:";
+	}
+	
 	// endianness (little)
 	dataLayout += "e-";
 	
@@ -239,18 +236,8 @@ TranslationContext::TranslationContext(LLVMContext& context, const x86_config& c
 	char addressSize[] = ":512";
 	snprintf(addressSize, sizeof addressSize, ":%zu", config.address_size * 8);
 	dataLayout += string("p1") + addressSize + addressSize + addressSize;
+	
 	module->setDataLayout(dataLayout);
-	
-	Triple triple;
-	switch (config.isa)
-	{
-		case x86_isa32: triple.setArch(Triple::x86); break;
-		case x86_isa64: triple.setArch(Triple::x86_64); break;
-		default: llvm_unreachable("x86 ISA cannot map to target triple architecture");
-	}
-	triple.setOS(Triple::UnknownOS);
-	triple.setVendor(Triple::UnknownVendor);
-	
 	module->setTargetTriple(triple.str());
 }
 
@@ -263,7 +250,7 @@ void TranslationContext::setFunctionName(uint64_t address, const std::string &na
 	functionMap->getCallTarget(address)->setName(name);
 }
 
-Function* TranslationContext::createFunction(Executable& executable, uint64_t baseAddress)
+Function* TranslationContext::createFunction(uint64_t baseAddress)
 {
 	Function* fn = functionMap->createFunction(baseAddress);
 	assert(fn != nullptr);
@@ -272,7 +259,7 @@ Function* TranslationContext::createFunction(Executable& executable, uint64_t ba
 	AddressToBlock blockMap(*fn);
 	BasicBlock* entry = &fn->back();
 	
-	Argument* registers = static_cast<Argument*>(fn->arg_begin());
+	Argument* registers = &*fn->arg_begin();
 	auto flags = new AllocaInst(irgen->getFlagsTy(), "flags", entry);
 	
 	ArrayRef<Value*> ipGepIndices = irgen->getIpOffset();
@@ -280,7 +267,7 @@ Function* TranslationContext::createFunction(Executable& executable, uint64_t ba
 	Type* ipType = GetElementPtrInst::getIndexedType(irgen->getRegisterTy(), ipGepIndices);
 	
 	Function* prologue = irgen->implementationForPrologue();
-	irgen->inlineFunction(fn, prologue, { configVariable, registers }, *functionMap, blockMap, baseAddress);
+	irgen->inlineFunction(fn, prologue, { configVariable, registers, flags }, *functionMap, blockMap, baseAddress);
 	
 	uint64_t addressToDisassemble;
 	auto end = executable.end();
@@ -315,15 +302,6 @@ Function* TranslationContext::createFunction(Executable& executable, uint64_t ba
 		}
 		break;
 	}
-	
-#if DEBUG && 0
-	// check that it still works
-	if (verifyModule(*module, &errs()))
-	{
-		module->dump();
-		abort();
-	}
-#endif
 	
 	return fn;
 }

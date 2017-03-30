@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "metadata.h"
@@ -45,33 +33,51 @@ namespace
 		}
 		return false;
 	}
-	
-	void ensureFunctionBody(Function& fn)
+}
+
+void md::ensureFunctionBody(Function& fn)
+{
+	assert(fn.getParent() != nullptr);
+	if (fn.isDeclaration())
 	{
-		assert(fn.getParent() != nullptr);
-		if (fn.isDeclaration())
+		LLVMContext& ctx = fn.getContext();
+		Function* placeholder = Function::Create(fn.getFunctionType(), GlobalValue::ExternalWeakLinkage, "fcd.placeholder", fn.getParent());
+		BasicBlock* body = BasicBlock::Create(ctx, "", &fn);
+		SmallVector<Value*, 4> args;
+		for (Argument& arg : fn.args())
 		{
-			LLVMContext& ctx = fn.getContext();
-			Function* placeholder = Function::Create(fn.getFunctionType(), GlobalValue::ExternalWeakLinkage, "fcd.placeholder", fn.getParent());
-			BasicBlock* body = BasicBlock::Create(ctx, "", &fn);
-			SmallVector<Value*, 4> args;
-			for (Argument& arg : fn.args())
+			args.push_back(&arg);
+		}
+		
+		auto callResult = CallInst::Create(placeholder, args, "", body);
+		ReturnInst::Create(ctx, fn.getReturnType()->isVoidTy() ? nullptr : callResult, body);
+	}
+}
+
+vector<string> md::getIncludedFiles(Module& module)
+{
+	vector<string> result;
+	if (MDNode* node = dyn_cast_or_null<MDNode>(module.getModuleFlag("fcd.includes")))
+	{
+		for (Metadata* op : node->operands())
+		{
+			if (auto file = dyn_cast<MDString>(op))
 			{
-				args.push_back(&arg);
+				result.push_back(file->getString());
 			}
-			
-			auto callResult = CallInst::Create(placeholder, args, "", body);
-			ReturnInst::Create(ctx, fn.getReturnType()->isVoidTy() ? nullptr : callResult, body);
 		}
 	}
+	return result;
 }
 
 ConstantInt* md::getStackPointerArgument(const Function &fn)
 {
 	if (auto node = fn.getMetadata("fcd.stackptr"))
-	if (auto constant = dyn_cast<ConstantAsMetadata>(node->getOperand(0)))
 	{
-		return dyn_cast<ConstantInt>(constant->getValue());
+		if (auto constant = dyn_cast<ConstantAsMetadata>(node->getOperand(0)))
+		{
+			return dyn_cast<ConstantInt>(constant->getValue());
+		}
 	}
 	return nullptr;
 }
@@ -79,22 +85,48 @@ ConstantInt* md::getStackPointerArgument(const Function &fn)
 ConstantInt* md::getVirtualAddress(const Function& fn)
 {
 	if (auto node = fn.getMetadata("fcd.vaddr"))
-	if (auto constantMD = dyn_cast<ConstantAsMetadata>(node->getOperand(0)))
-	if (auto constantInt = dyn_cast<ConstantInt>(constantMD->getValue()))
 	{
-		return constantInt;
+		if (auto constantMD = dyn_cast<ConstantAsMetadata>(node->getOperand(0)))
+		{
+			if (auto constantInt = dyn_cast<ConstantInt>(constantMD->getValue()))
+			{
+				return constantInt;
+			}
+		}
 	}
 	return nullptr;
 }
 
-MDString* md::getImportName(const Function& fn)
+unsigned md::getFunctionVersion(const Function& fn)
 {
-	if (auto node = fn.getMetadata("fcd.importname"))
-	if (auto nameNode = dyn_cast<MDString>(node->getOperand(0)))
+	if (auto node = fn.getMetadata("fcd.funver"))
 	{
-		return nameNode;
+		if (auto constantMD = dyn_cast<ConstantAsMetadata>(node->getOperand(0)))
+		{
+			if (auto constantInt = dyn_cast<ConstantInt>(constantMD->getValue()))
+			{
+				return static_cast<unsigned>(constantInt->getLimitedValue());
+			}
+		}
+	}
+	return 0;
+}
+
+Function* md::getFinalPrototype(const Function& fn)
+{
+	if (auto node = fn.getMetadata("fcd.prototype"))
+	{
+		if (auto valueAsMd = dyn_cast<ValueAsMetadata>(node->getOperand(0)))
+		{
+			return cast<Function>(valueAsMd->getValue());
+		}
 	}
 	return nullptr;
+}
+
+bool md::isStub(const Function &fn)
+{
+	return fn.getMetadata("fcd.stub") != nullptr;
 }
 
 bool md::areArgumentsRecoverable(const Function &fn)
@@ -104,7 +136,7 @@ bool md::areArgumentsRecoverable(const Function &fn)
 
 bool md::isPrototype(const Function &fn)
 {
-	if (fn.isDeclaration() || md::getImportName(fn) != nullptr)
+	if (fn.isDeclaration() || md::isStub(fn))
 	{
 		return true;
 	}
@@ -124,11 +156,6 @@ bool md::isPrototype(const Function &fn)
 	return false;
 }
 
-bool md::isPartOfOutput(const Function& fn)
-{
-	return fn.getMetadata("fcd.output") != nullptr;
-}
-
 bool md::isStackFrame(const AllocaInst &alloca)
 {
 	return alloca.getMetadata("fcd.stackframe") != nullptr;
@@ -142,11 +169,24 @@ bool md::isProgramMemory(const Instruction &value)
 MDString* md::getAssemblyString(const Function& fn)
 {
 	if (auto node = fn.getMetadata("fcd.asm"))
-	if (auto nameNode = dyn_cast<MDString>(node->getOperand(0)))
 	{
-		return nameNode;
+		if (auto nameNode = dyn_cast<MDString>(node->getOperand(0)))
+		{
+			return nameNode;
+		}
 	}
 	return nullptr;
+}
+
+void md::addIncludedFiles(Module& module, const vector<string>& includedFiles)
+{
+	LLVMContext& ctx = module.getContext();
+	SmallVector<Metadata*, 20> mdIncludes;
+	for (const auto& file : includedFiles)
+	{
+		mdIncludes.push_back(MDString::get(ctx, file));
+	}
+	module.addModuleFlag(Module::AppendUnique, "fcd.includes", MDNode::get(ctx, mdIncludes));
 }
 
 void md::setVirtualAddress(Function& fn, uint64_t virtualAddress)
@@ -158,18 +198,32 @@ void md::setVirtualAddress(Function& fn, uint64_t virtualAddress)
 	fn.setMetadata("fcd.vaddr", vaddrNode);
 }
 
-void md::setImportName(Function& fn, StringRef name)
+void md::incrementFunctionVersion(llvm::Function &fn)
+{
+	unsigned newVersion = getFunctionVersion(fn) + 1;
+	auto& ctx = fn.getContext();
+	ConstantInt* cNewVersion = ConstantInt::get(Type::getInt32Ty(ctx), newVersion);
+	MDNode* versionNode = MDNode::get(ctx, ConstantAsMetadata::get(cNewVersion));
+	fn.setMetadata("fcd.funver", versionNode);
+}
+
+void md::setFinalPrototype(Function& stub, Function& target)
+{
+	ensureFunctionBody(stub);
+	ensureFunctionBody(target);
+	stub.setMetadata("fcd.prototype", MDNode::get(stub.getContext(), ValueAsMetadata::get(&target)));
+}
+
+void md::setIsStub(Function &fn, bool stub)
 {
 	ensureFunctionBody(fn);
-	if (name.size() == 0)
+	if (stub)
 	{
-		fn.setMetadata("fcd.importname", nullptr);
+		setFlag(fn, "fcd.stub");
 	}
 	else
 	{
-		auto& ctx = fn.getContext();
-		MDNode* nameNode = MDNode::get(ctx, MDString::get(ctx, name));
-		fn.setMetadata("fcd.importname", nameNode);
+		fn.setMetadata("fcd.stub", nullptr);
 	}
 }
 
@@ -199,20 +253,6 @@ void md::removeStackPointerArgument(Function& fn)
 {
 	ensureFunctionBody(fn);
 	fn.setMetadata("fcd.stackptr", nullptr);
-}
-
-void md::setIsPartOfOutput(Function& fn, bool partOfOutput)
-{
-	ensureFunctionBody(fn);
-	if (partOfOutput)
-	{
-		assert(fn.getName().size() != 0);
-		setFlag(fn, "fcd.output");
-	}
-	else
-	{
-		fn.setMetadata("fcd,output", nullptr);
-	}
 }
 
 void md::setAssemblyString(Function &fn, StringRef assembly)
@@ -253,17 +293,13 @@ void md::copy(const Function& from, Function& to)
 	{
 		setVirtualAddress(to, address->getLimitedValue());
 	}
-	if (auto name = getImportName(from))
+	if (auto target = getFinalPrototype(from))
 	{
-		setImportName(to, name->getString());
+		setFinalPrototype(to, *target);
 	}
 	if (areArgumentsRecoverable(from))
 	{
 		setArgumentsRecoverable(to);
-	}
-	if (isPartOfOutput(from))
-	{
-		setIsPartOfOutput(to);
 	}
 }
 
@@ -272,7 +308,7 @@ bool md::isRegisterStruct(const Value &value)
 	if (auto arg = dyn_cast<Argument>(&value))
 	{
 		const Function& fn = *arg->getParent();
-		return areArgumentsRecoverable(fn) && arg == fn.arg_begin();
+		return areArgumentsRecoverable(fn) && arg == &*fn.arg_begin();
 	}
 	
 	if (auto alloca = dyn_cast<AllocaInst>(&value))
@@ -305,7 +341,7 @@ void md::setRecoveredReturnFieldNames(Module& module, StructType& returnType, co
 	
 	string key;
 	bool result = getMdNameForType(returnType, key);
-	assert(result);
+	assert(result); (void) result;
 	
 	auto mdNode = module.getOrInsertNamedMetadata(key);
 	for (const ValueInformation& vi : callInfo.returns())
@@ -333,10 +369,14 @@ StringRef md::getRecoveredReturnFieldName(Module& module, StructType& returnType
 {
 	string key;
 	if (getMdNameForType(returnType, key))
-	if (auto mdNode = module.getNamedMetadata(key))
-	if (i < mdNode->getNumOperands())
 	{
-		return cast<MDString>(mdNode->getOperand(i)->getOperand(0))->getString();
+		if (auto mdNode = module.getNamedMetadata(key))
+		{
+			if (i < mdNode->getNumOperands())
+			{
+				return cast<MDString>(mdNode->getOperand(i)->getOperand(0))->getString();
+			}
+		}
 	}
 	
 	return "";

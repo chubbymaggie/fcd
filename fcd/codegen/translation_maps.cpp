@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "metadata.h"
@@ -33,7 +21,6 @@ Function* AddressToFunction::insertFunction(uint64_t address)
 	// XXX: do we really want external linkage? this has an impact on possible optimizations
 	Function* fn = Function::Create(&fnType, GlobalValue::ExternalLinkage, defaultName, &module);
 	md::setVirtualAddress(*fn, address);
-	md::setIsPartOfOutput(*fn);
 	md::setArgumentsRecoverable(*fn);
 	return fn;
 }
@@ -79,7 +66,6 @@ Function* AddressToFunction::createFunction(uint64_t address)
 	// reset prototype status (and everything else, really)
 	result->deleteBody();
 	BasicBlock::Create(result->getContext(), "entry", result);
-	md::setIsPartOfOutput(*result);
 	md::setVirtualAddress(*result, address);
 	md::setArgumentsRecoverable(*result);
 	return result;
@@ -128,7 +114,8 @@ llvm::BasicBlock* AddressToBlock::implementInstruction(uint64_t address)
 	
 	bodyBlock = BasicBlock::Create(insertInto.getContext(), "", &insertInto);
 	
-	unsigned pointerSize = ((sizeof address * CHAR_BIT) - __builtin_clzll(address) + CHAR_BIT - 1) / CHAR_BIT * 2;
+	auto leadingZeroes = static_cast<unsigned>(__builtin_clzll(address));
+	unsigned pointerSize = ((sizeof address * CHAR_BIT) - leadingZeroes + CHAR_BIT - 1) / CHAR_BIT * 2;
 	
 	// set block name (aesthetic reasons)
 	char blockName[] = "0000000000000000";

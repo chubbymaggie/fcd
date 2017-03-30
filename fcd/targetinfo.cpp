@@ -3,32 +3,17 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
-#include "llvm_warnings.h"
 #include "metadata.h"
 #include "targetinfo.h"
 #include "x86_register_map.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/ADT/Triple.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Module.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <iostream>
 
@@ -49,9 +34,9 @@ unique_ptr<TargetInfo> TargetInfo::getTargetInfo(const Module& module)
 	return nullptr;
 }
 
-GetElementPtrInst* TargetInfo::getRegister(llvm::Value *registerStruct, const TargetRegisterInfo& info) const
+Instruction* TargetInfo::getRegister(llvm::Value *registerStruct, const TargetRegisterInfo& info, Instruction& insertionPoint) const
 {
-	const auto& largest = *largestOverlappingRegister(info);
+	const auto& largest = largestOverlappingRegister(info);
 	
 	const TargetRegisterInfo* selected = nullptr;
 	for (const auto& targetReg : targetRegisterInfo())
@@ -68,18 +53,29 @@ GetElementPtrInst* TargetInfo::getRegister(llvm::Value *registerStruct, const Ta
 		return nullptr;
 	}
 	
-	SmallVector<Value*, 4> indices;
 	LLVMContext& ctx = registerStruct->getContext();
 	IntegerType* int32 = Type::getInt32Ty(ctx);
 	IntegerType* int64 = Type::getInt64Ty(ctx);
-	CompositeType* currentType = cast<CompositeType>(registerStruct->getType());
+	
+	SmallVector<Value*, 4> indices { ConstantInt::get(int64, 0) };
+	CompositeType* currentType = cast<CompositeType>(cast<PointerType>(registerStruct->getType())->getElementType());
 	for (unsigned offset : selected->gepOffsets)
 	{
 		IntegerType* constantType = isa<StructType>(currentType) ? int32 : int64;
 		indices.push_back(ConstantInt::get(constantType, offset));
 		currentType = dyn_cast<CompositeType>(currentType->getTypeAtIndex(offset));
 	}
-	return GetElementPtrInst::CreateInBounds(registerStruct, indices);
+	
+	Instruction* result = GetElementPtrInst::CreateInBounds(registerStruct, indices, "", &insertionPoint);
+	if (info.subOffset != 0)
+	{
+		auto intptrTy = dl->getIntPtrType(ctx);
+		auto asInt = CastInst::CreateBitOrPointerCast(result, intptrTy, "", &insertionPoint);
+		auto added = BinaryOperator::CreateAdd(asInt, ConstantInt::get(intptrTy, info.subOffset), "", &insertionPoint);
+		auto resultType = Type::getIntNTy(ctx, static_cast<unsigned>(info.size * CHAR_BIT));
+		result = CastInst::CreateBitOrPointerCast(added, resultType, "", &insertionPoint);
+	}
+	return result;
 }
 
 const TargetRegisterInfo* TargetInfo::registerInfo(unsigned int registerId) const
@@ -139,7 +135,7 @@ const TargetRegisterInfo* TargetInfo::registerInfo(size_t offset, size_t size) c
 	return nullptr;
 }
 
-const TargetRegisterInfo* TargetInfo::largestOverlappingRegister(const TargetRegisterInfo& overlapped) const
+const TargetRegisterInfo& TargetInfo::largestOverlappingRegister(const TargetRegisterInfo& overlapped) const
 {
 	auto iter = targetRegisterInfo().begin();
 	auto end = targetRegisterInfo().end();
@@ -150,10 +146,10 @@ const TargetRegisterInfo* TargetInfo::largestOverlappingRegister(const TargetReg
 		{
 			if (&*iter == &overlapped)
 			{
-				return &currentTarget;
+				return currentTarget;
 			}
 			iter++;
 		}
 	}
-	return nullptr;
+	llvm_unreachable("Missing register in largestOverlappingRegister?!");
 }

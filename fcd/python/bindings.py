@@ -5,20 +5,8 @@
 # Copyright (C) 2015 Félix Cloutier.
 # All Rights Reserved.
 #
-# This file is part of fcd.
-# 
-# fcd is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# 
-# fcd is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-# 
-# You should have received a copy of the GNU General Public License
-# along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+# This file is distributed under the University of Illinois Open Source
+# license. See LICENSE.md for details.
 #
 
 #
@@ -246,8 +234,10 @@ for returnType, name, parameters in callbackRE.findall(contents):
 	callbacks[proto.name] = proto
 
 for body, name in enumRE.findall(contents):
-	e = CEnum(name, body)
-	enums[e.name] = e
+	# HACKHACK LLVM 3.9: deprecated enum causes name conflict
+	if name != "LLVMAttribute":
+		e = CEnum(name, body)
+		enums[e.name] = e
 
 for returnType, name, parameters in prototypeRE.findall(contents):
 	p = CPrototype(returnType, name, parameters)
@@ -403,11 +393,11 @@ for classKey in classes:
 					methodImplementations += "\tif (!seq%i)\n" % i
 					methodImplementations += "\t{\n\t\treturn nullptr;\n\t}\n"
 					methodImplementations += "\tPy_ssize_t len%i = PySequence_Size(seq%i.get());\n" % (i, i)
-					methodImplementations += "\tstd::unique_ptr<%s[]> array%i(new %s[len%i]);\n" % (llvmType, i, llvmType, i)
+					methodImplementations += "\tstd::unique_ptr<%s[]> array%i(new %s[static_cast<size_t>(len%i)]);\n" % (llvmType, i, llvmType, i)
 					methodImplementations += "\tfor (Py_ssize_t i = 0; i < len%i; ++i)\n" % i
 					methodImplementations += "\t{\n"
 					methodImplementations += "\t\tauto wrapped = (Py_LLVM_Wrapped<%s>*)PySequence_Fast_GET_ITEM(seq%i.get(), i);\n" % (llvmType, i)
-					methodImplementations += "\t\tarray%i[i] = wrapped->obj;\n" % i
+					methodImplementations += "\t\tarray%i[static_cast<size_t>(i)] = wrapped->obj;\n" % i
 					methodImplementations += "\t}\n"
 					cParams.append("array%i.get()" % i)
 					cParams.append("len%i" % i)
@@ -428,7 +418,7 @@ for classKey in classes:
 		elif method.returnType.type == "string":
 			methodImplementations += "\treturn PyString_FromString(%s);\n" % returnedExpression
 		elif method.returnType.type == "int":
-			methodImplementations += "\treturn PyInt_FromLong(%s);\n" % returnedExpression
+			methodImplementations += "\treturn PyInt_FromLong(static_cast<long>(%s));\n" % returnedExpression
 		elif method.returnType.type == "bool":
 			methodImplementations += "\treturn PyBool_FromLong(%s);\n" % returnedExpression
 		elif method.returnType.type == "void":

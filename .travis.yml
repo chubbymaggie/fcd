@@ -1,0 +1,74 @@
+language: c++
+dist: trusty
+sudo: true
+
+env:
+  global:
+  - TRAVIS_ENCRYPTION_LABEL="d0f036b99c7e"
+
+matrix:
+  include:
+  - os: linux
+  - os: osx
+
+addons:
+  apt:
+    sources:
+    - llvm-toolchain-trusty-4.0
+    - ubuntu-toolchain-r-test
+    packages:
+    - clang-4.0
+    - clang-4.0-dev
+    - cmake
+    - cmake-data
+    - libz-dev
+    - libedit-dev
+    - llvm-4.0
+    - llvm-4.0-dev
+    - libstdc++-6-dev
+    - python-dev
+
+before_install:
+- git clone "https://github.com/zneak/fcd-tests.git" tests
+
+install:
+-
+  if [ "${TRAVIS_OS_NAME}" = "linux" ]; then
+    curl -Ls https://github.com/aquynh/capstone/archive/3.0.4.tar.gz -o capstone-3.0.4.tar.gz;
+    tar -xf capstone-3.0.4.tar.gz;
+    pushd capstone-3.0.4;
+    make -j3;
+    sudo make install;
+    popd;
+  else
+    brew update;
+    brew install capstone;
+    mkdir -p "llvm";
+    curl -s "http://llvm.org/pre-releases/4.0.0/rc2/clang+llvm-4.0.0-rc2-x86_64-apple-darwin.tar.xz" -o llvm.tar.xz;
+    tar -xf llvm.tar.xz --strip-components=1 -C llvm;
+  fi;
+
+script:
+- 
+  if [ "${TRAVIS_OS_NAME}" = "linux" ]; then
+    rm -rf build && mkdir build && pushd build;
+    export LLVM_DIR="/usr/lib/llvm-4.0/lib/cmake/llvm/";
+    export CC="clang-4.0" CXX="clang++-4.0";
+    cmake ..;
+    if make -j3; then
+      export FCD="build/fcd";
+    else
+      exit 1;
+    fi;
+    popd;
+  else
+    if xcodebuild -target fcd -configuration Release CAPSTONE_DIR="/usr/local/Cellar/capstone/3.0.4" LLVM_BUILD_DIR="llvm"; then
+      export FCD="build/Release/fcd";
+    else
+      exit 1;
+    fi;
+  fi;
+
+after_success:
+-
+  tests/test.sh "${FCD}" "$(git rev-parse --verify HEAD)"

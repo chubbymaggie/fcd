@@ -3,25 +3,19 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 #include "x86.emulator.h"
 #include <cstring>
 #include <limits.h>
 #include <type_traits>
+
+struct x86_effective_address
+{
+	x86_reg segment;
+	uint64_t pointer;
+};
 
 [[gnu::always_inline]]
 static bool x86_parity(uint64_t value)
@@ -153,40 +147,61 @@ static void x86_write_reg(PTR(x86_regs) regs, CPTR(cs_x86_op) reg, uint64_t valu
 }
 
 [[gnu::always_inline]]
-static uint64_t x86_get_effective_address(CPTR(x86_regs) regs, CPTR(cs_x86_op) op)
+static x86_effective_address x86_get_effective_address(CPTR(x86_regs) regs, CPTR(cs_x86_op) op)
 {
+	x86_effective_address result;
 	const x86_op_mem* address = &op->mem;
-	uint64_t value = address->disp;
-	if (address->segment != X86_REG_INVALID)
+	result.pointer = address->disp;
+	if (address->segment == X86_REG_INVALID)
 	{
-		value += x86_read_reg(regs, static_cast<x86_reg>(address->segment));
+		switch (address->base)
+		{
+			case X86_REG_BP:
+			case X86_REG_EBP:
+			case X86_REG_RBP:
+				result.segment = X86_REG_SS;
+				break;
+				
+			case X86_REG_IP:
+			case X86_REG_EIP:
+			case X86_REG_RIP:
+				result.segment = X86_REG_CS;
+				break;
+				
+			default:
+				result.segment = X86_REG_INVALID;
+		}
+	}
+	else
+	{
+		result.segment = static_cast<x86_reg>(address->segment);
 	}
 	
 	if (address->index != X86_REG_INVALID)
 	{
 		uint64_t index = x86_read_reg(regs, static_cast<x86_reg>(address->index));
-		value += index * address->scale;
+		result.pointer += index * address->scale;
 	}
 	
 	if (address->base != X86_REG_INVALID)
 	{
-		value += x86_read_reg(regs, static_cast<x86_reg>(address->base));
+		result.pointer += x86_read_reg(regs, static_cast<x86_reg>(address->base));
 	}
-	return value;
+	return result;
 }
 
 [[gnu::always_inline]]
 static uint64_t x86_read_mem(CPTR(x86_regs) regs, CPTR(cs_x86_op) op)
 {
-	uint64_t address = x86_get_effective_address(regs, op);
-	return x86_read_mem(address, op->size);
+	auto address = x86_get_effective_address(regs, op);
+	return x86_read_mem(address.segment, address.pointer, op->size);
 }
 
 [[gnu::always_inline]]
 static void x86_write_mem(CPTR(x86_regs) regs, CPTR(cs_x86_op) op, uint64_t value)
 {
-	uint64_t address = x86_get_effective_address(regs, op);
-	x86_write_mem(address, op->size, value);
+	auto address = x86_get_effective_address(regs, op);
+	x86_write_mem(address.segment, address.pointer, op->size, value);
 }
 
 [[gnu::always_inline]]
@@ -247,55 +262,69 @@ static void x86_write_destination_operand(CPTR(cs_x86_op) destination, PTR(x86_r
 	}
 }
 
+template<typename T>
+[[gnu::always_inline]]
+static typename std::make_unsigned<T>::type x86_add_flags(PTR(x86_flags_reg) flags, uint64_t left, uint64_t right)
+{
+	typedef typename std::make_signed<T>::type sint;
+	typedef typename std::make_unsigned<T>::type uint;
+	
+	uint unsignedResult;
+	sint signedResult;
+	flags->cf |= __builtin_add_overflow(static_cast<uint>(left), static_cast<uint>(right), &unsignedResult);
+	flags->of |= __builtin_add_overflow(static_cast<sint>(left), static_cast<sint>(right), &signedResult);
+	flags->sf = signedResult < 0;
+	return unsignedResult;
+}
+
 [[gnu::always_inline]]
 static uint64_t x86_add(PTR(x86_flags_reg) flags, size_t size, uint64_t left, uint64_t right)
 {
-	size_t bits_set = size * CHAR_BIT;
-	unsigned long long result;
-	uint64_t sign_mask = make_mask(bits_set - 1);
-	bool carry = __builtin_uaddll_overflow(left, right, &result);
-	if (size == 1 || size == 2 || size == 4)
+	uint64_t result;
+	switch (size)
 	{
-		uint64_t mask = make_mask(bits_set);
-		carry = result > mask;
-		result &= mask;
-	}
-	else if (size != 8)
-	{
-		x86_assertion_failure("invalid destination size");
+		case 1: result = x86_add_flags<int8_t>(flags, left, right); break;
+		case 2: result = x86_add_flags<int16_t>(flags, left, right); break;
+		case 4: result = x86_add_flags<int32_t>(flags, left, right); break;
+		case 8: result = x86_add_flags<int64_t>(flags, left, right); break;
+		default: x86_assertion_failure("invalid destination size");
 	}
 	
-	flags->cf |= carry;
 	flags->af |= (left & 0xf) + (right & 0xf) > 0xf;
-	flags->of |= ((left ^ result) & (right ^ result)) > sign_mask;
-	flags->sf = result > sign_mask;
 	flags->zf = result == 0;
 	flags->pf = x86_parity(result);
 	return result;
 }
 
+template<typename T>
+[[gnu::always_inline]]
+static typename std::make_unsigned<T>::type x86_sub_flags(PTR(x86_flags_reg) flags, uint64_t left, uint64_t right)
+{
+	typedef typename std::make_signed<T>::type sint;
+	typedef typename std::make_unsigned<T>::type uint;
+	
+	uint unsignedResult;
+	sint signedResult;
+	flags->cf |= __builtin_sub_overflow(static_cast<uint>(left), static_cast<uint>(right), &unsignedResult);
+	flags->of |= __builtin_sub_overflow(static_cast<sint>(left), static_cast<sint>(right), &signedResult);
+	flags->sf = signedResult < 0;
+	return unsignedResult;
+}
+
 [[gnu::always_inline]]
 static uint64_t x86_subtract(PTR(x86_flags_reg) flags, size_t size, uint64_t left, uint64_t right)
 {
-	size_t bits_set = size * CHAR_BIT;
-	uint64_t sign_mask = make_mask(bits_set - 1);
-	unsigned long long result;
-	bool carry = __builtin_usubll_overflow(left, right, &result);
-	if (size == 1 || size == 2 || size == 4)
+	uint64_t result;
+	switch (size)
 	{
-		uint64_t mask = make_mask(bits_set);
-		carry = result > mask;
-		result &= mask;
-	}
-	else if (size != 8)
-	{
-		x86_assertion_failure("invalid destination size");
+		case 1: result = x86_sub_flags<int8_t>(flags, left, right); break;
+		case 2: result = x86_sub_flags<int16_t>(flags, left, right); break;
+		case 4: result = x86_sub_flags<int32_t>(flags, left, right); break;
+		case 8: result = x86_sub_flags<int64_t>(flags, left, right); break;
+		default: x86_assertion_failure("invalid destination size");
 	}
 	
-	flags->cf |= carry;
 	flags->af |= (left & 0xf) - (right & 0xf) > 0xf;
-	flags->of |= ((left ^ result) & (left ^ right)) > sign_mask;
-	flags->sf = result > sign_mask;
 	flags->zf = result == 0;
 	flags->pf = x86_parity(result);
 	return result;
@@ -325,7 +354,7 @@ static uint64_t x86_logical_operator(PTR(x86_regs) regs, PTR(x86_flags_reg) flag
 static void x86_push_value(CPTR(x86_config) config, PTR(x86_regs) regs, size_t size, uint64_t value)
 {
 	uint64_t push_address = x86_read_reg(regs, config->sp) - size;
-	x86_write_mem(push_address, size, value);
+	x86_write_mem(X86_REG_SS, push_address, size, value);
 	x86_write_reg(regs, config->sp, push_address);
 }
 
@@ -333,7 +362,7 @@ static void x86_push_value(CPTR(x86_config) config, PTR(x86_regs) regs, size_t s
 static uint64_t x86_pop_value(CPTR(x86_config) config, PTR(x86_regs) regs, size_t size)
 {
 	uint64_t pop_address = x86_read_reg(regs, config->sp);
-	uint64_t popped = x86_read_mem(pop_address, size);
+	uint64_t popped = x86_read_mem(X86_REG_SS, pop_address, size);
 	x86_write_reg(regs, config->sp, pop_address + size);
 	return popped;
 }
@@ -369,37 +398,37 @@ static void x86_move_sign_extend(PTR(x86_regs) regs, CPTR(cs_x86) inst)
 [[gnu::always_inline]]
 static bool x86_cond_above(CPTR(x86_flags_reg) flags)
 {
-	return flags->cf == false && flags->zf == false;
+	return !flags->cf & !flags->zf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_above_or_equal(CPTR(x86_flags_reg) flags)
 {
-	return flags->cf == false;
+	return !flags->cf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_below(CPTR(x86_flags_reg) flags)
 {
-	return flags->cf == true;
+	return flags->cf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_below_or_equal(CPTR(x86_flags_reg) flags)
 {
-	return flags->cf == true || flags->zf == true;
+	return flags->cf | flags->zf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_equal(CPTR(x86_flags_reg) flags)
 {
-	return flags->zf == true;
+	return flags->zf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_greater(CPTR(x86_flags_reg) flags)
 {
-	return flags->zf == false && flags->sf == flags->of;
+	return !flags->zf & (flags->sf == flags->of);
 }
 
 [[gnu::always_inline]]
@@ -417,49 +446,49 @@ static bool x86_cond_less(CPTR(x86_flags_reg) flags)
 [[gnu::always_inline]]
 static bool x86_cond_less_or_equal(CPTR(x86_flags_reg) flags)
 {
-	return flags->zf == true || flags->sf != flags->of;
+	return flags->zf | (flags->sf != flags->of);
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_not_equal(CPTR(x86_flags_reg) flags)
 {
-	return flags->zf == false;
+	return !flags->zf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_no_overflow(CPTR(x86_flags_reg) flags)
 {
-	return flags->of == false;
+	return !flags->of;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_no_parity(CPTR(x86_flags_reg) flags)
 {
-	return flags->pf == false;
+	return !flags->pf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_no_sign(CPTR(x86_flags_reg) flags)
 {
-	return flags->sf == false;
+	return !flags->sf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_overflow(CPTR(x86_flags_reg) flags)
 {
-	return flags->of == true;
+	return flags->of;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_parity(CPTR(x86_flags_reg) flags)
 {
-	return flags->pf == true;
+	return flags->pf;
 }
 
 [[gnu::always_inline]]
 static bool x86_cond_signed(CPTR(x86_flags_reg) flags)
 {
-	return flags->sf == true;
+	return flags->sf;
 }
 
 [[gnu::always_inline]]
@@ -472,11 +501,45 @@ static void x86_conditional_jump(CPTR(x86_config) config, PTR(x86_regs) regs, CP
 	}
 }
 
+[[gnu::always_inline]]
+static bool x86_rep_condition(CPTR(x86_config) config, PTR(x86_regs) regs, CPTR(cs_x86) inst)
+{
+	if (inst->prefix[0] == X86_PREFIX_REP)
+	{
+		x86_reg counter = config->address_size == 8 ? X86_REG_RCX : X86_REG_ECX;
+		uint64_t registerValue = x86_read_reg(regs, counter);
+		if (registerValue != 0)
+		{
+			x86_write_reg(regs, counter, registerValue - 1);
+			return true;
+		}
+	}
+	return false;
+}
+
+template<typename Int>
+[[gnu::always_inline]]
+static void x86_stos(CPTR(x86_config) config, PTR(x86_regs) regs, CPTR(x86_flags_reg) flags, CPTR(cs_x86) inst, const Int& writeValue)
+{
+	bool alwaysDoFirst = inst->prefix[0] != X86_PREFIX_REP;
+	while (alwaysDoFirst || x86_rep_condition(config, regs, inst))
+	{
+		x86_reg addressRegister = config->address_size == 8 ? X86_REG_RDI : X86_REG_EDI;
+		uint64_t address = x86_read_reg(regs, addressRegister);
+		x86_write_mem(X86_REG_ES, x86_read_reg(regs, addressRegister), sizeof writeValue, writeValue);
+		x86_write_reg(regs, addressRegister, address + (flags->df ? -1 : 1) * sizeof writeValue);
+		alwaysDoFirst = false;
+	}
+}
+
 #pragma mark - Helpers
-extern "C" void x86_function_prologue(CPTR(x86_config) config, PTR(x86_regs) regs)
+extern "C" void x86_function_prologue(CPTR(x86_config) config, PTR(x86_regs) regs, PTR(x86_flags_reg) flags)
 {
 	uint64_t ip = x86_read_reg(regs, config->ip);
 	x86_push_value(config, regs, config->address_size, ip);
+	
+	// Uh-oh: this might not always be true. There's not much to do about it, though.
+	flags->df = false;
 }
 
 #pragma mark - Instruction Implementation
@@ -1059,8 +1122,8 @@ X86_INSTRUCTION_DEF(lea)
 {
 	const cs_x86_op* destination = &inst->operands[0];
 	const cs_x86_op* source = &inst->operands[1];
-	uint64_t value = x86_get_effective_address(regs, source);
-	x86_write_destination_operand(destination, regs, value);
+	auto address = x86_get_effective_address(regs, source);
+	x86_write_destination_operand(destination, regs, address.pointer);
 }
 
 X86_INSTRUCTION_DEF(leave)
@@ -1197,7 +1260,9 @@ X86_INSTRUCTION_DEF(popf)
 	flags->zf = flatFlags & 1;
 	flatFlags >>= 1;
 	flags->sf = flatFlags & 1;
-	flatFlags >>= 4;
+	flatFlags >>= 3;
+	flags->df = flatFlags & 1;
+	flatFlags >>= 1;
 	flags->of = flatFlags & 1;
 }
 
@@ -1212,7 +1277,9 @@ X86_INSTRUCTION_DEF(pushf)
 {
 	uint64_t flatFlags = 0;
 	flatFlags |= flags->of;
-	flatFlags <<= 2;
+	flatFlags <<= 1;
+	flatFlags |= flags->df;
+	flatFlags <<= 1;
 	flatFlags |= 1;
 	flatFlags <<= 2;
 	flatFlags |= flags->sf;
@@ -1489,6 +1556,26 @@ X86_INSTRUCTION_DEF(stc)
 	flags->cf = 1;
 }
 
+X86_INSTRUCTION_DEF(stosb)
+{
+	x86_stos(config, regs, flags, inst, regs->a.low.low.low);
+}
+
+X86_INSTRUCTION_DEF(stosd)
+{
+	x86_stos(config, regs, flags, inst, regs->a.low.low.word);
+}
+
+X86_INSTRUCTION_DEF(stosq)
+{
+	x86_stos(config, regs, flags, inst, regs->a.qword);
+}
+
+X86_INSTRUCTION_DEF(stosw)
+{
+	x86_stos(config, regs, flags, inst, regs->a.low.dword);
+}
+
 X86_INSTRUCTION_DEF(sub)
 {
 	const cs_x86_op* source = &inst->operands[1];
@@ -1504,6 +1591,16 @@ X86_INSTRUCTION_DEF(sub)
 X86_INSTRUCTION_DEF(test)
 {
 	x86_logical_operator(regs, flags, inst, [](uint64_t left, uint64_t right) { return left & right; });
+}
+
+X86_INSTRUCTION_DEF(xchg)
+{
+	const cs_x86_op* first = &inst->operands[0];
+	const cs_x86_op* second = &inst->operands[1];
+	uint64_t left = x86_read_destination_operand(first, regs);
+	uint64_t right = x86_read_destination_operand(second, regs);
+	x86_write_destination_operand(first, regs, right);
+	x86_write_destination_operand(second, regs, left);
 }
 
 X86_INSTRUCTION_DEF(xor)

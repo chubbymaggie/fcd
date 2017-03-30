@@ -3,4 +3,5 @@ fcd.xcodeproj/project.xcworkspace/xcuserdata
 *.ll
 build/
 *.user
-
+*.pyc
+.DS_Store

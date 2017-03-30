@@ -3,30 +3,15 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "dumb_allocator.h"
-#include "llvm_warnings.h"
 #include "metadata.h"
 #include "passes.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/PatternMatch.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <deque>
 #include <map>
@@ -55,12 +40,11 @@ namespace
 		};
 		
 	private:
-		StackObject* parent;
 		ObjectType type;
 		
 	public:
 		StackObject(ObjectType type, StackObject* parent = nullptr)
-		: parent(nullptr), type(type)
+		: type(type)
 		{
 		}
 		
@@ -153,7 +137,7 @@ namespace
 				}
 				else if (!isa<StoreInst>(offsetUser) && !isa<CallInst>(offsetUser))
 				{
-					assert(isa<BinaryOperator>(offsetUser) || isa<PHINode>(offsetUser));
+					assert(isa<BinaryOperator>(offsetUser) || isa<PHINode>(offsetUser) || isa<SelectInst>(offsetUser) || isa<CmpInst>(offsetUser));
 				}
 			}
 			
@@ -280,7 +264,7 @@ namespace
 			
 			int64_t endOffset(const DataLayout& dl) const
 			{
-				return offset + size(dl);
+				return offset + static_cast<int64_t>(size(dl));
 			}
 		};
 		
@@ -317,7 +301,7 @@ namespace
 				++outputIter;
 			}
 			
-			for (int i = 8; i > 0 && difference > 0; i /= 2)
+			for (unsigned i = 8; i > 0 && difference > 0; i /= 2)
 			{
 				if (difference >= i)
 				{
@@ -444,7 +428,7 @@ namespace
 				int64_t frontDifference = startOffset - iterFront;
 				if (frontDifference > 0)
 				{
-					pad(ctx, frontDifference, front_inserter(structBody));
+					pad(ctx, static_cast<uint64_t>(frontDifference), front_inserter(structBody));
 					startOffset = iterFront;
 					fieldCount++;
 				}
@@ -453,7 +437,7 @@ namespace
 				int64_t backDifference = iterEnd - endOffset;
 				if (backDifference > 0)
 				{
-					pad(ctx, backDifference, back_inserter(structBody));
+					pad(ctx, static_cast<uint64_t>(backDifference), back_inserter(structBody));
 					endOffset = iterEnd;
 				}
 				
@@ -572,7 +556,7 @@ namespace
 			return result;
 		}
 		
-		Type* reduceStructField(OverlappingTypedAccesses& typedAccesses, GepLink* parentLink, int64_t index)
+		Type* reduceStructField(OverlappingTypedAccesses& typedAccesses, GepLink* parentLink, uint64_t index)
 		{
 			Type* resultType;
 			unordered_map<const StackObject*, int> gep;
@@ -585,7 +569,7 @@ namespace
 			}
 			
 			Type* i32 = Type::getInt32Ty(ctx);
-			auto linkIndex = ConstantInt::get(i32, static_cast<unsigned>(index));
+			auto linkIndex = ConstantInt::get(i32, index);
 			if (structFieldCount == 1)
 			{
 				for (const auto& access : typedAccesses)
@@ -679,7 +663,7 @@ namespace
 						fieldTypes.push_back(result);
 					}
 					
-					size_t padding = field.offset - typedAccesses.endOffset();
+					long long padding = field.offset - typedAccesses.endOffset();
 					if (padding > 0)
 					{
 						Type* i8 = Type::getInt8Ty(ctx);
@@ -844,17 +828,17 @@ namespace
 	};
 	
 	// This pass needs to run AFTER argument recovery.
-	struct IdentifyLocals : public ModulePass
+	struct IdentifyLocals final : public ModulePass
 	{
 		static char ID;
-		const DataLayout* dl;
-		bool changed;
+		const DataLayout* dl = nullptr;
+		bool changed = false;
 		
 		IdentifyLocals() : ModulePass(ID)
 		{
 		}
 		
-		virtual const char* getPassName() const override
+		virtual StringRef getPassName() const override
 		{
 			return "Identify locals";
 		}
@@ -869,7 +853,7 @@ namespace
 			
 			auto arg = fn.arg_begin();
 			advance(arg, stackPointerIndex->getLimitedValue());
-			return static_cast<Argument*>(arg);
+			return &*arg;
 		}
 		
 		bool analyzeObject(Value& base, bool& hasCastInst, map<int64_t, Instruction*>& constantOffsets, map<int64_t, Instruction*>& variableOffsetStrides)
@@ -953,6 +937,7 @@ namespace
 				auto front = constantOffsets.begin()->first;
 				auto back = constantOffsets.rbegin()->first;
 				assert(front == 0 || back == 0 || signbit(front) == signbit(back));
+				(void) back;
 				
 				unique_ptr<StructureStackObject> structure(new StructureStackObject(parent));
 				if (hasCastInst)
@@ -1079,7 +1064,7 @@ namespace
 						}
 					}
 					
-					// leave old function to rot
+					fn.eraseFromParent();
 					changed = true;
 				}
 			}
@@ -1091,7 +1076,7 @@ namespace
 			if (auto root = readObject(*stackPointer, nullptr))
 			if (auto llvmFrame = LlvmStackFrame::representObject(fn.getContext(), *dl, cast<StructureStackObject>(*root)))
 			{
-				auto allocaInsert = static_cast<Instruction*>(fn.getEntryBlock().getFirstInsertionPt());
+				auto allocaInsert = &*fn.getEntryBlock().getFirstInsertionPt();
 				Type* naiveType = llvmFrame->getNaiveType(*root);
 				AllocaInst* stackFrame = new AllocaInst(naiveType, "stackframe", allocaInsert);
 				md::setStackFrame(*stackFrame);
@@ -1116,9 +1101,4 @@ namespace
 	
 	char IdentifyLocals::ID = 0;
 	RegisterPass<IdentifyLocals> identifyLocals("recoverstackframe", "Identify local variables");
-}
-
-ModulePass* createIdentifyLocalsPass()
-{
-	return new IdentifyLocals;
 }

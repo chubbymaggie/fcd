@@ -3,26 +3,14 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__x86_x86_emulator_h
 #define fcd__x86_x86_emulator_h
 
-#include <capstone.h>
+#include <capstone/capstone.h>
 #include "x86_regs.h"
 
 static_assert(X86_INS_ENDING == 1295, "Fcd requires Capstone 3.0.4.");
@@ -33,8 +21,8 @@ static_assert(X86_INS_ENDING == 1295, "Fcd requires Capstone 3.0.4.");
 #define CPTR(t) [[gnu::nonnull]] const t* __restrict__
 
 #pragma mark - Intrinsic functions (handled by emulator)
-extern "C" void x86_write_mem(uint64_t address, size_t size, uint64_t value);
-extern "C" uint64_t x86_read_mem(uint64_t address, size_t size);
+extern "C" void x86_write_mem(x86_reg segment, uint64_t address, size_t size, uint64_t value);
+extern "C" uint64_t x86_read_mem(x86_reg segment, uint64_t address, size_t size);
 extern "C" void x86_call_intrin(CPTR(x86_config) config, PTR(x86_regs) regs, uint64_t target);
 NORETURN extern "C" void x86_jump_intrin(CPTR(x86_config) config, PTR(x86_regs) regs, uint64_t target);
 NORETURN extern "C" void x86_ret_intrin(CPTR(x86_config) config, PTR(x86_regs) regs);

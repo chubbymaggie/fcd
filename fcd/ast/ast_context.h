@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef expression_context_hpp
@@ -57,9 +45,15 @@ class AstContext
 	std::unique_ptr<TypeIndex> types;
 	std::unordered_map<const llvm::StructType*, StructExpressionType*> structTypeMap;
 	
-	Expression* trueExpr;
-	Expression* undef;
-	Expression* null;
+	ExpressionReference trueExpr;
+	ExpressionReference falseExpr;
+	ExpressionReference undef;
+	ExpressionReference null;
+	
+	ExpressionReference memcpyToken;
+	ExpressionReference memmoveToken;
+	ExpressionReference memsetToken;
+	ExpressionReference trapToken;
 	
 	Expression* uncachedExpressionFor(llvm::Value& value);
 	
@@ -104,9 +98,18 @@ public:
 	DumbAllocator& getPool() { return pool; }
 	
 	Expression* expressionFor(llvm::Value& value);
-	Expression* expressionForTrue() { return trueExpr; }
-	Expression* expressionForUndef() { return undef; }
-	Expression* expressionForNull() { return null; }
+	Expression* expressionForTrue() { return trueExpr.get(); }
+	Expression* expressionForFalse() { return falseExpr.get(); }
+	Expression* expressionForUndef() { return undef.get(); }
+	Expression* expressionForNull() { return null.get(); }
+	
+	std::vector<Expression*> allBuiltinExpressions()
+	{
+		return {
+			trueExpr.get(), falseExpr.get(), undef.get(), null.get(),
+			memcpyToken.get(), memmoveToken.get(), memsetToken.get(), trapToken.get()
+		};
+	}
 	
 	Statement* statementFor(llvm::Instruction& inst);
 	
@@ -119,6 +122,26 @@ public:
 	NAryOperatorExpression* nary(NAryOperatorExpression::NAryOperatorType type, unsigned numElements = 2)
 	{
 		return allocate<true, NAryOperatorExpression>(numElements, type);
+	}
+	
+	template<typename Iterator, typename = typename std::enable_if<std::is_convertible<decltype(*std::declval<Iterator>()), Expression*>::value, void>::type>
+	Expression* nary(NAryOperatorExpression::NAryOperatorType type, Iterator begin, Iterator end, bool returnSingle = false)
+	{
+		auto count = static_cast<unsigned>(end - begin);
+		assert(count > 0);
+		if (count == 1 && returnSingle)
+		{
+			return *begin;
+		}
+		
+		auto result = nary(type, count);
+		unsigned index = 0;
+		for (auto iter = begin; iter != end; ++iter)
+		{
+			setOperand(result, index, *iter);
+			++index;
+		}
+		return result;
 	}
 	
 	template<typename... TExpressionType>
@@ -174,9 +197,9 @@ public:
 		return allocate<false, AssemblyExpression>(0, type, assembly);
 	}
 	
-	AssignableExpression* assignable(const ExpressionType& type, llvm::StringRef prefix)
+	AssignableExpression* assignable(const ExpressionType& type, llvm::StringRef prefix, bool addressable = false)
 	{
-		return allocate<false, AssignableExpression>(0, type, prefix);
+		return allocate<false, AssignableExpression>(0, type, prefix, addressable);
 	}
 	
 #pragma mark Simple transformations
@@ -189,19 +212,29 @@ public:
 		return allocateStatement<ExpressionStatement>(1, expr);
 	}
 	
-	SequenceStatement* sequence()
+	IfElseStatement* ifElse(NOT_NULL(Expression) condition)
 	{
-		return allocateStatement<SequenceStatement>(0, pool);
+		return allocateStatement<IfElseStatement>(1, condition);
 	}
 	
-	IfElseStatement* ifElse(NOT_NULL(Expression) condition, NOT_NULL(Statement) ifBody, Statement* elseBody = nullptr)
+	IfElseStatement* ifElse(NOT_NULL(Expression) condition, StatementReference&& ifBody)
 	{
-		return allocateStatement<IfElseStatement>(1, condition, ifBody, elseBody);
+		return allocateStatement<IfElseStatement>(1, condition, std::move(ifBody).take());
 	}
 	
-	LoopStatement* loop(NOT_NULL(Expression) condition, LoopStatement::ConditionPosition pos, NOT_NULL(Statement) body)
+	IfElseStatement* ifElse(NOT_NULL(Expression) condition, StatementReference&& ifBody, StatementReference&& elseBody)
 	{
-		return allocateStatement<LoopStatement>(1, condition, pos, body);
+		return allocateStatement<IfElseStatement>(1, condition, std::move(ifBody).take(), std::move(elseBody).take());
+	}
+	
+	LoopStatement* loop(NOT_NULL(Expression) condition, LoopStatement::ConditionPosition pos)
+	{
+		return allocateStatement<LoopStatement>(1, condition, pos);
+	}
+	
+	LoopStatement* loop(NOT_NULL(Expression) condition, LoopStatement::ConditionPosition pos, StatementList&& body)
+	{
+		return allocateStatement<LoopStatement>(1, condition, pos, std::move(body));
 	}
 	
 	KeywordStatement* keyword(const char* keyword, Expression* operand = nullptr)
@@ -214,9 +247,16 @@ public:
 		return keyword("break");
 	}
 	
-	NoopStatement* noop()
+	Statement* breakStatement(NOT_NULL(Expression) condition)
 	{
-		return allocateStatement<NoopStatement>(0);
+		if (condition == expressionForTrue())
+		{
+			return breakStatement();
+		}
+		else
+		{
+			return ifElse(condition, { breakStatement() });
+		}
 	}
 	
 #pragma mark - Φ Nodes

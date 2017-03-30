@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__ast_expressions_h
@@ -26,12 +14,9 @@
 #include "expression_type.h"
 #include "expression_use.h"
 #include "expression_user.h"
-#include "llvm_warnings.h"
 #include "not_null.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/ADT/iterator_range.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <string>
 
@@ -150,7 +135,7 @@ public:
 		// are the only postfix unary operators.
 		Increment = Min, Decrement,
 		AddressOf, Dereference,
-		LogicalNegate,
+		ArithmeticNegate, LogicalNegate, BinaryNegate,
 		Max
 	};
 	
@@ -182,8 +167,6 @@ public:
 // Represents a chain of the same binary operator. For instance, +(a, b, c) would be a + b + c.
 class NAryOperatorExpression final : public Expression
 {
-	AstContext& ctx;
-	
 	template<typename... TExpressionType>
 	void setOperands(unsigned index, NOT_NULL(Expression) expr, TExpressionType&&... exprs)
 	{
@@ -231,8 +214,9 @@ public:
 	}
 	
 	NAryOperatorExpression(AstContext& ctx, unsigned uses, NAryOperatorType type)
-	: Expression(NAryOperator, ctx, uses), ctx(ctx), type(type)
+	: Expression(NAryOperator, ctx, uses), type(type)
 	{
+		assert(uses > 0);
 	}
 	
 	template<typename... TExpressionType>
@@ -246,25 +230,6 @@ public:
 	NAryOperatorType getType() const { return type; }
 	
 	using ExpressionUser::setOperand;
-	using ExpressionUser::erase;
-	
-	template<typename TIter>
-	void addOperands(TIter begin, TIter end)
-	{
-		for (auto iter = begin; iter != end; ++iter)
-		{
-			addOperand(*iter);
-		}
-	}
-	
-	template<typename... TExpressionType>
-	void addOperand(NOT_NULL(Expression) expression, TExpressionType... expressions)
-	{
-		addOperand(expression);
-		addOperand(expressions...);
-	}
-	
-	void addOperand(NOT_NULL(Expression) expression) { insertUseAtEnd().setUse(expression); }
 	
 	virtual const ExpressionType& getExpressionType(AstContext& context) const override;
 	virtual bool operator==(const Expression& that) const override;
@@ -420,7 +385,6 @@ public:
 	const_iterator params_cend() const { return operands_end(); }
 	llvm::iterator_range<iterator> params() { return llvm::make_range(params_begin(), params_end()); }
 	llvm::iterator_range<const_iterator> params() const { return llvm::make_range(params_begin(), params_end()); }
-	iterator erase(iterator param);
 	
 	template<typename TIter>
 	void addParameter(TIter begin, TIter end)
@@ -531,13 +495,14 @@ struct AssignableExpression final : public Expression
 {
 	const ExpressionType& expressionType;
 	NOT_NULL(const char) prefix;
+	bool addressable;
 	
 	static bool classof(const ExpressionUser* node)
 	{
 		return node->getUserType() == Assignable;
 	}
 	
-	AssignableExpression(AstContext& ctx, unsigned uses, const ExpressionType& type, llvm::StringRef assembly);
+	AssignableExpression(AstContext& ctx, unsigned uses, const ExpressionType& type, llvm::StringRef prefix, bool addressable = false);
 	
 	virtual const ExpressionType& getExpressionType(AstContext&) const override { return expressionType; }
 	virtual bool operator==(const Expression& that) const override;

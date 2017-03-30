@@ -3,24 +3,11 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
-#include "clone.h"
-#include "pass_branchcombine.h"
+#include "ast_passes.h"
 #include "visitor.h"
 
 #include <cstring>
@@ -65,105 +52,81 @@ namespace
 		return aInfo.second != bInfo.second && *aInfo.first == *bInfo.first;
 	}
 	
-	class ConsecutiveCombiner : public AstVisitor<ConsecutiveCombiner, false, Statement*>
+	class MemoryOperationVisitor : public AstVisitor<MemoryOperationVisitor, false, bool>
+	{
+	public:
+		bool visitUnaryOperator(UnaryOperatorExpression& unary)
+		{
+			return unary.getType() == UnaryOperatorExpression::Dereference || visit(*unary.getOperand());
+		}
+		
+		bool visitNAryOperator(NAryOperatorExpression& nary)
+		{
+			return nary.getType() == NAryOperatorExpression::Assign || any_of(nary.operands(), [&](ExpressionUse& use)
+			{
+				return visit(*use.getUse());
+			});
+		}
+		
+		bool visitTernary(TernaryExpression& ternary)
+		{
+			return visit(*ternary.getCondition()) || visit(*ternary.getTrueValue()) || visit(*ternary.getFalseValue());
+		}
+		
+		bool visitCast(CastExpression& cast)
+		{
+			return visit(*cast.getCastValue());
+		}
+		
+		bool visitSubscript(SubscriptExpression& subscript)
+		{
+			return true;
+		}
+		
+		bool visitMemberAccess(MemberAccessExpression& memberAccess)
+		{
+			return true;
+		}
+		
+		bool visitCall(CallExpression& call)
+		{
+			return true;
+		}
+		
+		bool visitAggregate(AggregateExpression& agg)
+		{
+			return false;
+		}
+		
+		bool visitNumeric(NumericExpression& numeric)
+		{
+			return false;
+		}
+		
+		bool visitToken(TokenExpression& token)
+		{
+			return false;
+		}
+		
+		bool visitAssembly(AssemblyExpression& assembly)
+		{
+			return false;
+		}
+		
+		bool visitAssignable(AssignableExpression& assignable)
+		{
+			return false;
+		}
+		
+		bool visitDefault(ExpressionUser& user)
+		{
+			llvm_unreachable("unimplemented expression clone case");
+		}
+	};
+	
+	class ConsecutiveCombiner : public AstVisitor<ConsecutiveCombiner, false, StatementReference>
 	{
 		AstContext& ctx;
-		
-		void collectStatements(deque<NOT_NULL(Statement)>& into, Statement* stmt)
-		{
-			if (stmt == nullptr)
-			{
-				return;
-			}
-			
-			if (auto seq = dyn_cast<SequenceStatement>(stmt))
-			{
-				for (Statement* substatement : *seq)
-				{
-					if (auto subseq = dyn_cast<SequenceStatement>(substatement))
-					{
-						collectStatements(into, subseq);
-					}
-					else if (auto simplified = visit(*substatement))
-					{
-						into.push_back(simplified);
-					}
-				}
-			}
-			else if (auto simplified = visit(*stmt))
-			{
-				into.push_back(simplified);
-			}
-		}
-		
-		Statement* optimizeSequence(deque<NOT_NULL(Statement)>& list)
-		{
-			if (list.size() == 0)
-			{
-				return nullptr;
-			}
-			else if (list.size() == 1)
-			{
-				return list.front();
-			}
-			
-			auto newSequence = ctx.sequence();
-			IfElseStatement* lastIfElse = nullptr;
-			for (NOT_NULL(Statement) stmt : list)
-			{
-				if (IfElseStatement* thisIfElse = dyn_cast<IfElseStatement>(stmt))
-				{
-					if (lastIfElse != nullptr)
-					{
-						if (isLogicallySame(*thisIfElse->getCondition(), *lastIfElse->getCondition()))
-						{
-							deque<NOT_NULL(Statement)> result;
-							collectStatements(result, lastIfElse->getIfBody());
-							collectStatements(result, thisIfElse->getIfBody());
-							lastIfElse->setIfBody(optimizeSequence(result));
-							
-							result.clear();
-							collectStatements(result, lastIfElse->getElseBody());
-							collectStatements(result, thisIfElse->getElseBody());
-							lastIfElse->setElseBody(optimizeSequence(result));
-							
-							thisIfElse->discardCondition();
-							continue;
-						}
-						else if (isLogicallyOpposite(*thisIfElse->getCondition(), *lastIfElse->getCondition()))
-						{
-							deque<NOT_NULL(Statement)> result;
-							collectStatements(result, lastIfElse->getIfBody());
-							collectStatements(result, thisIfElse->getElseBody());
-							lastIfElse->setIfBody(optimizeSequence(result));
-							
-							result.clear();
-							collectStatements(result, lastIfElse->getElseBody());
-							collectStatements(result, thisIfElse->getIfBody());
-							lastIfElse->setElseBody(optimizeSequence(result));
-							
-							thisIfElse->discardCondition();
-							continue;
-						}
-					}
-					lastIfElse = thisIfElse;
-				}
-				newSequence->pushBack(stmt);
-			}
-			return newSequence;
-		}
-		
-		Statement* flattenBody(Statement* oldBody)
-		{
-			if (oldBody == nullptr)
-			{
-				return nullptr;
-			}
-			
-			deque<NOT_NULL(Statement)> result;
-			collectStatements(result, oldBody);
-			return optimizeSequence(result);
-		}
 		
 	public:
 		ConsecutiveCombiner(AstContext& ctx)
@@ -171,209 +134,222 @@ namespace
 		{
 		}
 		
-		Statement* visitNoop(NoopStatement& noop)
+		StatementReference optimizeSequence(StatementList&& list)
 		{
-			return nullptr;
-		}
-		
-		Statement* visitSequence(SequenceStatement& sequence)
-		{
-			return flattenBody(&sequence);
-		}
-		
-		Statement* visitIfElse(IfElseStatement& ifElse)
-		{
-			auto ifBody = flattenBody(ifElse.getIfBody());
-			auto elseBody = flattenBody(ifElse.getElseBody());
-			
-			if (ifBody == nullptr && elseBody == nullptr)
+			StatementReference newSequence;
+			if (list.empty())
 			{
-				return nullptr;
+				return newSequence;
 			}
 			
-			auto condition = ifElse.getCondition();
-			if (ifBody == nullptr)
+			IfElseStatement* lastIfElse = nullptr;
+			while (!list.empty())
 			{
-				condition = ctx.negate(condition);
+				Statement* stmt = list.pop_front();
+				IfElseStatement* thisIfElse = dyn_cast<IfElseStatement>(stmt);
+				if (thisIfElse != nullptr)
+				{
+					if (lastIfElse != nullptr)
+					{
+						if (isLogicallySame(*thisIfElse->getCondition(), *lastIfElse->getCondition()))
+						{
+							StatementReference result;
+							result->push_back(move(lastIfElse->getIfBody()));
+							result->push_back(move(thisIfElse->getIfBody()));
+							lastIfElse->getIfBody() = optimizeSequence(move(result).take()).take();
+							
+							result->push_back(move(lastIfElse->getElseBody()));
+							result->push_back(move(thisIfElse->getElseBody()));
+							lastIfElse->getElseBody() = optimizeSequence(move(result).take()).take();
+							
+							thisIfElse->dropAllReferences();
+							continue;
+						}
+						else if (isLogicallyOpposite(*thisIfElse->getCondition(), *lastIfElse->getCondition()))
+						{
+							StatementReference result;
+							result->push_back(move(lastIfElse->getIfBody()));
+							result->push_back(move(thisIfElse->getElseBody()));
+							lastIfElse->getIfBody() = optimizeSequence(move(result).take()).take();
+							
+							result->push_back(move(lastIfElse->getElseBody()));
+							result->push_back(move(thisIfElse->getIfBody()));
+							lastIfElse->getElseBody() = optimizeSequence(move(result).take()).take();
+							
+							thisIfElse->dropAllReferences();
+							continue;
+						}
+					}
+				}
+				lastIfElse = thisIfElse;
+				newSequence->push_back(stmt);
+			}
+			return visitAll(*this, move(newSequence).take());
+		}
+		
+		StatementReference visitIfElse(IfElseStatement& ifElse)
+		{
+			StatementList::erase(&ifElse);
+			ExpressionReference condition = &*ifElse.getCondition();
+			auto ifBody = optimizeSequence(move(ifElse.getIfBody()));
+			auto elseBody = optimizeSequence(move(ifElse.getElseBody()));
+			ifElse.dropAllReferences();
+			
+			if (ifBody->empty() && elseBody->empty())
+			{
+				return {};
+			}
+			
+			if (ifBody->empty())
+			{
+				condition = ctx.negate(condition.get());
 				swap(ifBody, elseBody);
 			}
 			
-			return ctx.ifElse(condition, ifBody, elseBody);
+			if (condition.get() == ctx.expressionForTrue())
+			{
+				return ifBody;
+			}
+			else if (condition.get() == ctx.expressionForFalse())
+			{
+				return elseBody;
+			}
+			
+			// If there's an if and an else, always show the positive form first. For instance, "if foo != 4 A; else B;"
+			// becomes "if foo == 4 B; else A;".
+			if (!ifBody->empty() && !elseBody->empty())
+			{
+				auto negation = countNegationDepth(*condition.get());
+				if (negation.second)
+				{
+					condition = const_cast<Expression*>(negation.first);
+					swap(ifBody, elseBody);
+				}
+			}
+			
+			ifElse.setCondition(condition.get());
+			ifElse.getIfBody() = move(ifBody).take();
+			ifElse.getElseBody() = move(elseBody).take();
+			return { &ifElse };
 		}
 		
-		Statement* visitLoop(LoopStatement& loop)
+		StatementReference visitLoop(LoopStatement& loop)
 		{
-			auto loopBody = flattenBody(loop.getLoopBody());
-			return ctx.loop(loop.getCondition(), loop.getPosition(), loopBody == nullptr ? ctx.noop() : loopBody);
+			StatementList::erase(&loop);
+			loop.getLoopBody() = optimizeSequence(move(loop.getLoopBody())).take();
+			
+			// Change `do { if (foo) { ... } } while (foo);` into `while (foo) { ... }`.
+			if (loop.getPosition() == LoopStatement::PostTested)
+			if (auto ifElse = dyn_cast_or_null<IfElseStatement>(loop.getLoopBody().single()))
+			if (ifElse->getElseBody().empty())
+			if (*ifElse->getCondition() == *loop.getCondition())
+			{
+				loop.getLoopBody() = move(ifElse->getIfBody());
+				loop.setPosition(LoopStatement::PreTested);
+				ifElse->dropAllReferences();
+			}
+			
+			return { &loop };
 		}
 		
-		Statement* visitKeyword(KeywordStatement& keyword)
+		StatementReference visitKeyword(KeywordStatement& keyword)
 		{
-			return ctx.keyword(&*keyword.name, keyword.getOperand());
+			StatementList::erase(&keyword);
+			return { &keyword };
 		}
 		
-		Statement* visitExpr(ExpressionStatement& expression)
+		StatementReference visitExpr(ExpressionStatement& expression)
 		{
-			return ctx.expr(expression.getExpression());
+			StatementList::erase(&expression);
+			return { &expression };
 		}
 		
-		Statement* visitDefault(ExpressionUser& user)
+		StatementReference visitDefault(ExpressionUser& user)
 		{
-			llvm_unreachable("unimplemented expression clone case");
+			llvm_unreachable("unimplemented consecutive combiner case");
 		}
 	};
 	
 #pragma mark - NestedCombiner and helpers
-	class FindBreak : public AstVisitor<FindBreak, false, Statement*>
+	bool isBreak(StatementList& list)
 	{
-	public:
-		Statement* visitNoop(NoopStatement& noop)
+		if (auto keyword = dyn_cast_or_null<KeywordStatement>(list.single()))
 		{
-			return nullptr;
+			return strcmp(keyword->name, "break") == 0;
 		}
-		
-		Statement* visitSequence(SequenceStatement& sequence)
-		{
-			// unconditional breaks will necessarily be in the last statement
-			return sequence.size() > 0 ? visit(*sequence.back()) : nullptr;
-		}
-		
-		Statement* visitIfElse(IfElseStatement& ifElse)
-		{
-			return nullptr;
-		}
-		
-		Statement* visitLoop(LoopStatement& loop)
-		{
-			// a break found inside a loop won't have any impact on the outer loop, so leave it out
-			return nullptr;
-		}
-		
-		Statement* visitKeyword(KeywordStatement& keyword)
-		{
-			return strcmp(keyword.name, "break") == 0 ? &keyword : nullptr;
-		}
-		
-		Statement* visitExpr(ExpressionStatement& expression)
-		{
-			return nullptr;
-		}
-		
-		Statement* visitDefault(ExpressionUser& user)
-		{
-			llvm_unreachable("unimplemented expression clone case");
-		}
-	};
-	
-	Statement* findBreak(Statement* from)
-	{
-		return from == nullptr ? nullptr : FindBreak().visit(*from);
+		return false;
 	}
 	
-	Statement* get(Statement* stmt, Statement* (SequenceStatement::*method)())
-	{
-		while (auto seq = dyn_cast<SequenceStatement>(stmt))
-		{
-			if (seq->size() == 0)
-			{
-				break;
-			}
-			stmt = (seq->*method)();
-		}
-		return stmt;
-	}
-	
-	class NestedCombiner : public AstVisitor<NestedCombiner, false, Statement*>
+	class NestedCombiner : public AstVisitor<NestedCombiner, false, StatementReference>
 	{
 		AstContext& ctx;
 		
-		// CondToSeq, CondToSeqNeg, While and DoWhile all generalized in one single rule:
-		// If the loop starts or ends with a condition that breaks, then the loop has to be refined.
-		// (Also, these are allowed to run on loops that aren't endless. Improvement!)
-		// This doesn't do NestedDoWhile or LoopToSeq. LoopToSeq isn't expected to ever occur in fcd;
-		// NestedDoWhile hasn't been reimplemented.
-		Statement* structurizeLoop(LoopStatement& loop)
+		// The LoopToSeq rule is never relevant with fcd's input. The DoWhile, NestedDoWhile, CondToSeq and
+		// CondToSeqNeg are all very similar: you see if the last conditional of a loop has a break statement in it,
+		// essentially.
+		StatementReference structurizeLoop(LoopStatement& loop)
 		{
-			Statement* body = loop.getLoopBody();
+			StatementList& body = loop.getLoopBody();
 			SmallVector<pair<IfElseStatement*, LoopStatement::ConditionPosition>, 2> eligibleConditions;
-			if (auto statement = dyn_cast<IfElseStatement>(body))
+			
+			if (body.multiple())
 			{
-				eligibleConditions.emplace_back(statement, LoopStatement::PreTested);
-			}
-			else if (auto seq = dyn_cast<SequenceStatement>(body))
-			{
-				if (seq->size() > 0)
+				if (auto frontCondition = dyn_cast<IfElseStatement>(body.front()))
 				{
-					if (auto frontCondition = dyn_cast<IfElseStatement>(get(seq, &SequenceStatement::front)))
-					{
-						eligibleConditions.emplace_back(frontCondition, LoopStatement::PreTested);
-					}
-					else if (auto backCondition = dyn_cast<IfElseStatement>(get(seq, &SequenceStatement::back)))
-					{
-						eligibleConditions.emplace_back(backCondition, LoopStatement::PostTested);
-					}
+					eligibleConditions.emplace_back(frontCondition, LoopStatement::PreTested);
 				}
+				else if (auto backCondition = dyn_cast<IfElseStatement>(body.back()))
+				{
+					eligibleConditions.emplace_back(backCondition, LoopStatement::PostTested);
+				}
+			}
+			else if (auto ifElse = dyn_cast_or_null<IfElseStatement>(body.single()))
+			{
+				eligibleConditions.emplace_back(ifElse, LoopStatement::PreTested);
 			}
 			
 			for (auto& eligibleCondition : eligibleConditions)
 			{
 				auto ifElse = eligibleCondition.first;
-				auto trueStatement = ifElse->getIfBody();
-				auto falseStatement = ifElse->getElseBody();
-				Expression* ifElseCond = ifElse->getCondition();
-				Statement* trueBreak = findBreak(trueStatement);
-				Statement* falseBreak = findBreak(falseStatement);
-				if ((trueBreak == nullptr) != (falseBreak == nullptr))
+				StatementList& trueBranch = ifElse->getIfBody();
+				StatementList& falseBranch = ifElse->getElseBody();
+				bool trueBreak = isBreak(trueBranch);
+				bool falseBreak = isBreak(falseBranch);
+				if (trueBreak != falseBreak)
 				{
-					Statement* breakStatement;
-					Statement* loopSuccessor;
-					Statement* ifElseReplacement;
-					Expression* condition;
-					if (trueBreak != nullptr)
+					ExpressionReference condition = &*ifElse->getCondition();
+					StatementReference ifElseReplacement;
+					if (trueBreak)
 					{
-						breakStatement = trueBreak;
-						loopSuccessor = trueStatement;
-						// It's possible that there's no else statement.
-						ifElseReplacement = falseStatement == nullptr ? ctx.noop() : falseStatement;
-						condition = ctx.negate(ifElseCond);
+						ifElseReplacement = move(falseBranch);
+						condition = ctx.negate(condition.get());
 					}
 					else
 					{
-						breakStatement = falseBreak;
-						// There has to be an else statement, since it contained a break.
-						loopSuccessor = falseStatement;
-						ifElseReplacement = trueStatement;
-						condition = ifElseCond;
+						ifElseReplacement = move(trueBranch);
 					}
 					
-					ifElse->setElseBody(nullptr);
 					if (eligibleCondition.second == LoopStatement::PreTested)
 					{
 						// Disown statements owned by the if since we're moving them around the AST.
-						ifElse->setIfBody(ctx.noop());
-						ifElse->getParent()->replaceChild(ifElse, ifElseReplacement);
+						StatementList::insert(ifElse, move(ifElseReplacement).take());
+						StatementList::erase(ifElse);
+						ifElse->dropAllReferences();
 					}
 					else
 					{
-						// The condition needs to stay.
-						ifElse->setIfBody(ifElseReplacement);
-						ifElse->setCondition(condition);
+						// The conditional needs to stay in place.
+						ifElse->setCondition(condition.get());
+						ifElse->getIfBody() = move(ifElseReplacement).take();
+						ifElse->getElseBody().clear();
 					}
 					
-					auto newLoopBody = loop.getLoopBody();
-					loop.setLoopBody(ctx.noop());
-					
-					auto newCondition = ctx.nary(NAryOperatorExpression::ShortCircuitAnd, loop.getCondition(), condition);
-					auto newLoop = ctx.loop(newCondition, eligibleCondition.second, newLoopBody);
-					
-					auto outerBody = ctx.sequence();
-					outerBody->pushBack(structurizeLoop(*newLoop));
-					outerBody->pushBack(loopSuccessor);
-					breakStatement->getParent()->replaceChild(breakStatement, ctx.noop());
-					return outerBody;
+					loop.setCondition(ctx.nary(NAryOperatorExpression::ShortCircuitAnd, loop.getCondition(), condition.get()));
+					loop.setPosition(eligibleCondition.second);
+					break;
 				}
 			}
-			return &loop;
+			return { &loop };
 		}
 		
 	public:
@@ -382,66 +358,61 @@ namespace
 		{
 		}
 		
-		Statement* visitNoop(NoopStatement& noop)
+		StatementReference visitIfElse(IfElseStatement& ifElse)
 		{
-			return &noop;
-		}
-		
-		Statement* visitSequence(SequenceStatement& sequence)
-		{
-			for (auto iter = sequence.begin(); iter != sequence.end(); ++iter)
+			StatementList::erase(&ifElse);
+			
+			ifElse.getIfBody() = visitAll(*this, move(ifElse.getIfBody())).take();
+			ifElse.getElseBody() = visitAll(*this, move(ifElse.getElseBody())).take();
+			
+			// Check if there is no else, and the if body contained only an if statement. If so,
+			// merge the two if statements.
+			if (ifElse.getElseBody().empty())
+			if (auto innerIfElse = dyn_cast_or_null<IfElseStatement>(ifElse.getIfBody().single()))
+			if (innerIfElse->getElseBody().empty())
 			{
-				sequence.replace(iter, visit(**iter));
-			}
-			return &sequence;
-		}
-		
-		Statement* visitIfElse(IfElseStatement& ifElse)
-		{
-			auto ifBody = visit(*ifElse.getIfBody());
-			ifElse.setIfBody(ifBody);
-			if (auto elseBody = ifElse.getElseBody())
-			{
-				ifElse.setElseBody(visit(*elseBody));
-			}
-			else if (auto innerIf = dyn_cast<IfElseStatement>(ifBody))
-			{
-				if (innerIf->getElseBody() == nullptr)
+				// However, be mindful of conditions that contain a memory operation with multiple uses. This is because
+				// definition materialization could push the operation to appear to happen unconditionally, which would
+				// be deeply incorrect.
+				// XXX: the right way to solve this problem is to use LivenessAnalysis (from the variable congruence
+				// pass) to check for statement ordering, but the right way to do that is to expand the pass framework
+				// to have persistent and updatable analyses. It doesn't feel (yet) like this change would pull its own
+				// weight, so for now, just check that the condition doesn't involve memory operations.
+				ExpressionReference right = &*innerIfElse->getCondition();
+				if (!MemoryOperationVisitor().visit(*right.get()))
 				{
-					auto innerBody = innerIf->getIfBody();
-					innerIf->setIfBody(ctx.noop());
-					
-					auto left = ifElse.getCondition();
-					auto right = innerIf->getCondition();
-					auto combined = ctx.nary(NAryOperatorExpression::ShortCircuitAnd, left, right);
-					
-					ifElse.setCondition(combined);
-					ifElse.setIfBody(innerBody);
+					ExpressionReference left = &*ifElse.getCondition();
+					ifElse.setCondition(ctx.nary(NAryOperatorExpression::ShortCircuitAnd, left.get(), right.get()));
+					ifElse.getIfBody() = move(innerIfElse->getIfBody());
+					innerIfElse->dropAllReferences();
 				}
 			}
 			
-			return &ifElse;
+			return { &ifElse };
 		}
 		
-		Statement* visitLoop(LoopStatement& loop)
+		StatementReference visitLoop(LoopStatement& loop)
 		{
-			loop.setLoopBody(visit(*loop.getLoopBody()));
+			StatementList::erase(&loop);
+			loop.getLoopBody() = visitAll(*this, move(loop.getLoopBody())).take();
 			return structurizeLoop(loop);
 		}
 		
-		Statement* visitKeyword(KeywordStatement& keyword)
+		StatementReference visitKeyword(KeywordStatement& keyword)
 		{
-			return &keyword;
+			StatementList::erase(&keyword);
+			return { &keyword };
 		}
 		
-		Statement* visitExpr(ExpressionStatement& expression)
+		StatementReference visitExpr(ExpressionStatement& expression)
 		{
-			return &expression;
+			StatementList::erase(&expression);
+			return { &expression };
 		}
 		
-		Statement* visitDefault(ExpressionUser& user)
+		StatementReference visitDefault(ExpressionUser& user)
 		{
-			llvm_unreachable("unimplemented expression clone case");
+			llvm_unreachable("unimplemented nested combiner case");
 		}
 	};
 }
@@ -454,10 +425,10 @@ const char* AstBranchCombine::getName() const
 void AstBranchCombine::doRun(FunctionNode& fn)
 {
 	auto& context = fn.getContext();
-	Statement* body = fn.getBody();
-	body = ConsecutiveCombiner(context).visit(*body);
-	body = NestedCombiner(context).visit(*body);
+	ConsecutiveCombiner consecutive(context);
+	NestedCombiner nested(context);
+	fn.getBody() = consecutive.optimizeSequence(move(fn.getBody())).take();
+	fn.getBody() = visitAll(nested, move(fn.getBody())).take();
 	// NestedCombiner leaves clutter that ConsecutiveCombiner could get rid of
-	body = ConsecutiveCombiner(context).visit(*body);
-	fn.setBody(body);
+	fn.getBody() = consecutive.optimizeSequence(move(fn.getBody())).take();
 }

@@ -3,29 +3,15 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "ast_context.h"
 #include "expressions.h"
 #include "metadata.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/InstVisitor.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <deque>
 
@@ -133,12 +119,18 @@ class InstToExpr : public llvm::InstVisitor<InstToExpr, Expression*>
 			{
 				return ctx.memberAccess(base, static_cast<unsigned>(constant->getLimitedValue()));
 			}
-			llvm_unreachable("not implemented");
 		}
-		else
+		llvm_unreachable("not implemented");
+	}
+	
+	CallExpression* callFor(NOT_NULL(Expression) callee, ArrayRef<Value*> parameters)
+	{
+		auto callExpr = ctx.call(callee, static_cast<unsigned>(parameters.size()));
+		for (unsigned i = 0; i < parameters.size(); ++i)
 		{
-			llvm_unreachable("not implemented");
+			callExpr->setParameter(i, valueFor(*parameters[i]));
 		}
+		return callExpr;
 	}
 	
 public:
@@ -159,7 +151,12 @@ public:
 		}
 		else if (auto arg = dyn_cast<Argument>(&val))
 		{
-			return ctx.token(ctx.getType(*arg->getType()), arg->getName());
+			string argName = arg->getName();
+			if (argName.size() == 0 || argName[0] == '\0')
+			{
+				raw_string_ostream(argName) << "arg" << arg->getArgNo();
+			}
+			return ctx.token(ctx.getType(*arg->getType()), argName);
 		}
 		llvm_unreachable("unexpected type of value");
 	}
@@ -168,7 +165,8 @@ public:
 	{
 		if (auto constantInt = dyn_cast<ConstantInt>(&constant))
 		{
-			return ctx.numeric(ctx.getIntegerType(false, constantInt->getBitWidth()), constantInt->getLimitedValue());
+			assert(constantInt->getValue().ule(numeric_limits<uint64_t>::max()));
+			return ctx.numeric(ctx.getIntegerType(false, (unsigned short)constantInt->getBitWidth()), constantInt->getLimitedValue());
 		}
 		
 		if (auto expression = dyn_cast<ConstantExpr>(&constant))
@@ -245,7 +243,7 @@ public:
 	
 	VISIT(AllocaInst)
 	{
-		auto variable = ctx.assignable(ctx.getType(*inst.getAllocatedType()), "alloca");
+		auto variable = ctx.assignable(ctx.getType(*inst.getAllocatedType()), "alloca", true);
 		return ctx.unary(UnaryOperatorExpression::AddressOf, variable);
 	}
 	
@@ -257,21 +255,112 @@ public:
 	
 	VISIT(CallInst)
 	{
-		unsigned numParameters = inst.getNumArgOperands();
-		auto called = valueFor(*inst.getCalledValue());
-		auto callExpr = ctx.call(called, numParameters);
-		for (unsigned i = 0; i < inst.getNumArgOperands(); i++)
+		SmallVector<Value*, 8> values(inst.arg_begin(), inst.arg_end());
+		return callFor(valueFor(*inst.getCalledValue()), values);
+	}
+	
+	VISIT(IntrinsicInst)
+	{
+		if (ctx.module != nullptr)
 		{
-			auto operand = inst.getArgOperand(i);
-			callExpr->setParameter(i, valueFor(*operand));
+			Expression* intrinsic;
+			// Woah, there's an awful lot of these!... We only special-case those that come up relatively frequently.
+			switch (inst.getIntrinsicID())
+			{
+				case Intrinsic::ID::memcpy:
+					intrinsic = ctx.memcpyToken.get();
+					goto memoryOperation;
+					
+				case Intrinsic::ID::memmove:
+					intrinsic = ctx.memmoveToken.get();
+					goto memoryOperation;
+					
+				case Intrinsic::ID::memset:
+					intrinsic = ctx.memsetToken.get();
+					goto memoryOperation;
+					
+				memoryOperation:
+				{
+					Value* params[3] = {};
+					for (unsigned i = 0; i < 3; ++i)
+					{
+						params[i] = inst.getArgOperand(i);
+					}
+					return callFor(intrinsic, params);
+				}
+					
+				case Intrinsic::ID::trap:
+					return callFor(ctx.trapToken.get(), {});
+					
+				default:
+					break;
+			}
 		}
-		return callExpr;
+		return visitCallInst(inst);
 	}
 	
 	VISIT(BinaryOperator)
 	{
 		auto left = valueFor(*inst.getOperand(0));
 		auto right = valueFor(*inst.getOperand(1));
+		
+		if (inst.getOpcode() == BinaryOperator::Add)
+		{
+			if (auto constant = dyn_cast<NumericExpression>(right))
+			{
+				// special case for a + -const
+				const auto& type = constant->getExpressionType(ctx);
+				unsigned idleBits = 64 - type.getBits();
+				int64_t signedValue = (constant->si64 << idleBits) >> idleBits;
+				if (signedValue < 0)
+				{
+					// I'm pretty sure that we don't need to check for the minimum value for that type
+					// since a + INT_MIN is the same as a - INT_MIN.
+					auto positiveRight = ctx.numeric(type, static_cast<uint64_t>(-signedValue));
+					return ctx.nary(NAryOperatorExpression::Subtract, left, positiveRight);
+				}
+			}
+		}
+		else if (inst.getOpcode() == BinaryOperator::Xor)
+		{
+			Expression* negated = nullptr;
+			if (auto constant = dyn_cast<ConstantInt>(inst.getOperand(0)))
+			{
+				if (constant->isAllOnesValue())
+				{
+					negated = right;
+				}
+			}
+			else if (auto constant = dyn_cast<ConstantInt>(inst.getOperand(1)))
+			{
+				if (constant->isAllOnesValue())
+				{
+					negated = left;
+				}
+			}
+			
+			if (negated != nullptr)
+			{
+				// Special case for intN ^ [1 x N]
+				if (inst.getType()->getIntegerBitWidth() == 1)
+				{
+					return ctx.unary(UnaryOperatorExpression::LogicalNegate, negated);
+				}
+				else
+				{
+					return ctx.unary(UnaryOperatorExpression::BinaryNegate, negated);
+				}
+			}
+		}
+		else if (inst.getOpcode() == BinaryOperator::Sub)
+		{
+			if (auto constant = dyn_cast<ConstantInt>(inst.getOperand(0)))
+			if (constant->isZero())
+			{
+				return ctx.unary(UnaryOperatorExpression::ArithmeticNegate, right);
+			}
+		}
+		
 		return ctx.nary(getOperator(inst.getOpcode()), left, right);
 	}
 	
@@ -341,11 +430,11 @@ public:
 		const ExpressionType* resultType;
 		if (inst.getOpcode() == Instruction::SExt)
 		{
-			resultType = &ctx.getIntegerType(true, inst.getType()->getIntegerBitWidth());
+			resultType = &ctx.getIntegerType(true, (unsigned short)inst.getType()->getIntegerBitWidth());
 		}
 		else if (inst.getOpcode() == Instruction::ZExt)
 		{
-			resultType = &ctx.getIntegerType(false, inst.getType()->getIntegerBitWidth());
+			resultType = &ctx.getIntegerType(false, (unsigned short)inst.getType()->getIntegerBitWidth());
 		}
 		else
 		{
@@ -382,7 +471,7 @@ public:
 	
 	IntegerExpressionType& getIntegerType(bool isSigned, unsigned short numBits)
 	{
-		unsigned short key = ((isSigned != false) << 15) | (numBits & 0x7fff);
+		unsigned short key = static_cast<unsigned short>(((isSigned != false) << 15) | (numBits & 0x7fff));
 		auto& ptr = intTypes[key];
 		if (ptr == nullptr)
 		{
@@ -467,7 +556,6 @@ void* AstContext::prepareStorageAndUses(unsigned useCount, size_t storage)
 	auto objectStorage = reinterpret_cast<void*>(pointer + useDataSize);
 	assert((reinterpret_cast<uintptr_t>(objectStorage) & (alignof(void*) - 1)) == 0);
 	
-	//errs() << "pointer=" << (void*)pointer << " uses[" << useCount << "]=" << useBegin << " object=" << objectStorage << '\n';
 	return objectStorage;
 }
 
@@ -477,8 +565,36 @@ AstContext::AstContext(DumbAllocator& pool, Module* module)
 , types(new TypeIndex)
 {
 	trueExpr = token(getIntegerType(false, 1), "true");
+	falseExpr = token(getIntegerType(false, 1), "false");
 	undef = token(getVoid(), "__undefined");
 	null = token(getPointerTo(getVoid()), "null");
+	
+	// We need an LLVM context to get LLVM types, so this won't work when module is nullptr. It is only nullptr in
+	// debug scenarios, like when calling the dump method.
+	if (module != nullptr)
+	{
+		auto& llvmCtx = module->getContext();
+		const DataLayout& dl = module->getDataLayout();
+		auto voidTy = Type::getVoidTy(llvmCtx);
+		auto i8Ty = Type::getInt8Ty(llvmCtx);
+		auto i8PtrTy = Type::getInt8PtrTy(llvmCtx);
+		auto sizeTy = dl.getIntPtrType(llvmCtx);
+		
+		// The C mem* functions actually return pointers, but the LLVM versions don't, so there's no from declaring a
+		// return value.
+		auto memcpyType = FunctionType::get(voidTy, {i8PtrTy, i8PtrTy, sizeTy}, false);
+		const auto& memcpyAstType = getPointerTo(getType(*memcpyType));
+		memcpyToken = token(memcpyAstType, "memcpy");
+		memmoveToken = token(memcpyAstType, "memmove");
+		
+		auto memsetType = FunctionType::get(voidTy, {i8PtrTy, i8Ty, sizeTy}, false);
+		const auto& memsetAstType = getPointerTo(getType(*memsetType));
+		memsetToken = token(memsetAstType, "memset");
+		
+		auto trapType = FunctionType::get(voidTy, {}, false);
+		const auto& trapAstType = getPointerTo(getType(*trapType));
+		trapToken = token(trapAstType, "__builtin_trap");
+	}
 }
 
 AstContext::~AstContext()
@@ -561,6 +677,19 @@ Expression* AstContext::negate(NOT_NULL(Expression) expr)
 	{
 		return unary->getOperand();
 	}
+	
+	if (auto token = dyn_cast<TokenExpression>(expr))
+	{
+		if (strcmp(token->token, "true") == 0)
+		{
+			return expressionForFalse();
+		}
+		if (strcmp(token->token, "false") == 0)
+		{
+			return expressionForTrue();
+		}
+	}
+	
 	return unary(UnaryOperatorExpression::LogicalNegate, expr);
 }
 
@@ -585,7 +714,7 @@ const ExpressionType& AstContext::getType(Type &type)
 	}
 	else if (auto intTy = dyn_cast<IntegerType>(&type))
 	{
-		return getIntegerType(false, intTy->getBitWidth());
+		return getIntegerType(false, (unsigned short)intTy->getBitWidth());
 	}
 	else if (auto ptr = dyn_cast<PointerType>(&type))
 	{
@@ -615,10 +744,12 @@ const ExpressionType& AstContext::getType(Type &type)
 			if (structure->hasName())
 			{
 				name = structure->getName().str();
-			}
-			else
-			{
-				raw_string_ostream(name) << "struct" << types->size();
+				char structPrefix[] = "struct.";
+				size_t structPrefixSize = sizeof structPrefix - 1;
+				if (name.compare(0, structPrefixSize, structPrefix) == 0)
+				{
+					name = name.substr(structPrefixSize);
+				}
 			}
 			
 			structType = &createStructure(move(name));

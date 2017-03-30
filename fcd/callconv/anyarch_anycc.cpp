@@ -3,34 +3,19 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "anyarch_anycc.h"
 #include "cc_common.h"
-#include "llvm_warnings.h"
 #include "main.h"
 #include "metadata.h"
 #include "symbolic_expr.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/Constants.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <unordered_map>
 #include <unordered_set>
@@ -152,69 +137,72 @@ namespace
 			// location restored. This is an UNSAFE solution to a largely UNCOMPUTABLE problem.
 			if (!md::isProgramMemory(*load))
 			{
-				MemoryAccess* parent = mssa.getMemoryAccess(load)->getDefiningAccess();
-				if (isa<MemoryPhi>(parent))
+				MemoryAccess* parent = cast<MemoryUse>(mssa.getMemoryAccess(load))->getDefiningAccess();
+				if (auto useOrDef = cast<MemoryUseOrDef>(parent))
 				{
+					if (mssa.isLiveOnEntryDef(parent))
+					{
+						if (const TargetRegisterInfo* regMaybe = target.registerInfo(*load->getPointerOperand()))
+						{
+							const TargetRegisterInfo& reg = target.largestOverlappingRegister(*regMaybe);
+							return context.createLiveOnEntry(&reg);
+						}
+						return nullptr;
+					}
+					
+					// will die on non-trivial SExpressions
+					return backtrackSExpressionOfValue(target, mssa, context, useOrDef->getMemoryInst());
+				}
+				else
+				{
+					// implies isa<MemoryPhi>(parent)
 					// too hard, bail out
 					return nullptr;
 				}
-				
-				if (mssa.isLiveOnEntryDef(parent))
-				{
-					if (const TargetRegisterInfo* regMaybe = target.registerInfo(*load->getPointerOperand()))
-					if (const TargetRegisterInfo* reg = target.largestOverlappingRegister(*regMaybe))
-					{
-						return context.createLiveOnEntry(reg);
-					}
-					return nullptr;
-				}
-				
-				// will die on non-trivial SExpressions
-				return backtrackSExpressionOfValue(target, mssa, context, parent->getMemoryInst());
 			}
 			else
 			{
 				// Poor man's AA: find other instructions that use the same pointer operand. Expect a single load
 				// and a single store for a preserved register.
-				LoadInst* load = nullptr;
-				StoreInst* store = nullptr;
+				LoadInst* preservingLoad = nullptr;
+				StoreInst* preservingStore = nullptr;
 				for (User* user : load->getPointerOperand()->users())
 				{
 					if (LoadInst* asLoad = dyn_cast<LoadInst>(user))
 					{
-						if (load == nullptr)
+						if (preservingLoad == nullptr)
 						{
-							load = asLoad;
+							preservingLoad = asLoad;
 						}
 						else
 						{
-							load = nullptr;
+							preservingLoad = nullptr;
 							break;
 						}
 					}
 					else if (StoreInst* asStore = dyn_cast<StoreInst>(user))
 					{
-						if (store == nullptr)
+						if (preservingStore == nullptr)
 						{
-							store = asStore;
+							preservingStore = asStore;
 						}
 						else
 						{
-							store = nullptr;
+							preservingStore = nullptr;
 							break;
 						}
 					}
 					else
 					{
-						load = nullptr;
-						store = nullptr;
+						preservingLoad = nullptr;
+						preservingStore = nullptr;
 						break;
 					}
 				}
 				
-				if (load != nullptr && store != nullptr)
+				if (preservingLoad != nullptr && preservingStore != nullptr)
 				{
-					return backtrackSExpressionOfValue(target, mssa, context, store->getValueOperand());
+					return backtrackSExpressionOfValue(target, mssa, context, preservingStore->getValueOperand());
 				}
 				return nullptr;
 			}
@@ -255,12 +243,10 @@ namespace
 		{
 			auto simplified = ctx.simplify(backtracked);
 			if (auto live = dyn_cast_or_null<LiveOnEntryExpression>(simplified))
+			if (const TargetRegisterInfo* maybeStoreAt = target.registerInfo(*inst.getPointerOperand()))
 			{
-				if (const TargetRegisterInfo* maybeStoreAt = target.registerInfo(*inst.getPointerOperand()))
-					if (const TargetRegisterInfo* storeAt = target.largestOverlappingRegister(*maybeStoreAt))
-					{
-						return live->getRegisterInfo() == storeAt;
-					}
+				const TargetRegisterInfo& storeAt = target.largestOverlappingRegister(*maybeStoreAt);
+				return live->getRegisterInfo() == &storeAt;
 			}
 		}
 		return false;
@@ -293,7 +279,7 @@ namespace
 			break;
 		}
 		
-		unsigned intQueryResult = queryResult;
+		int intQueryResult = queryResult;
 		intQueryResult &= ~Incomplete;
 		
 		if (preservesRegister)
@@ -360,8 +346,8 @@ void CallingConvention_AnyArch_AnyCC::getAnalysisUsage(llvm::AnalysisUsage &au) 
 	au.addRequired<DominatorTreeWrapperPass>();
 	au.addPreserved<DominatorTreeWrapperPass>();
 	
-	au.addRequired<PostDominatorTree>();
-	au.addPreserved<PostDominatorTree>();
+	au.addRequired<PostDominatorTreeWrapperPass>();
+	au.addPreserved<PostDominatorTreeWrapperPass>();
 }
 
 bool CallingConvention_AnyArch_AnyCC::analyzeFunction(ParameterRegistry &registry, CallInformation &fillOut, llvm::Function &func)
@@ -371,7 +357,7 @@ bool CallingConvention_AnyArch_AnyCC::analyzeFunction(ParameterRegistry &registr
 		return false;
 	}
 	
-	auto regs = static_cast<Argument*>(func.arg_begin());
+	auto regs = &*func.arg_begin();
 	unordered_map<const TargetRegisterInfo*, ModRefInfo> resultMap;
 	
 	// Find all GEPs
@@ -381,9 +367,8 @@ bool CallingConvention_AnyArch_AnyCC::analyzeFunction(ParameterRegistry &registr
 	{
 		if (const TargetRegisterInfo* maybeRegister = target.registerInfo(*user))
 		{
-			const TargetRegisterInfo* registerInfo = target.largestOverlappingRegister(*maybeRegister);
-			assert(registerInfo != nullptr);
-			registerUsers.insert({registerInfo, user});
+			const TargetRegisterInfo& registerInfo = target.largestOverlappingRegister(*maybeRegister);
+			registerUsers.insert({&registerInfo, user});
 		}
 	}
 	
@@ -395,7 +380,7 @@ bool CallingConvention_AnyArch_AnyCC::analyzeFunction(ParameterRegistry &registr
 	}
 	
 	DominatorTree& preDom = registry.getAnalysis<DominatorTreeWrapperPass>(func).getDomTree();
-	PostDominatorTree& postDom = registry.getAnalysis<PostDominatorTree>(func);
+	PostDominatorTree& postDom = registry.getAnalysis<PostDominatorTreeWrapperPass>(func).getPostDomTree();
 	
 	// Add calls
 	SmallVector<CallInst*, 8> calls;
@@ -404,14 +389,14 @@ bool CallingConvention_AnyArch_AnyCC::analyzeFunction(ParameterRegistry &registr
 	for (const auto& pair : *thisFunc)
 	{
 		Function* callee = pair.second->getFunction();
-		const CallInformation& callInfo = *registry.getCallInfo(*callee);
-		if (callInfo.getStage() == CallInformation::Completed)
+		if (const CallInformation* callInfo = registry.getCallInfo(*callee))
+		if (callInfo->getStage() == CallInformation::Completed)
 		{
 			// pair.first is a weak value handle and has a cast operator to get the pointee
 			CallInst* caller = cast<CallInst>((Value*)pair.first);
 			calls.push_back(caller);
 			
-			for (const auto& vi : callInfo)
+			for (const auto& vi : *callInfo)
 			{
 				if (vi.type == ValueInformation::IntegerRegister)
 				{

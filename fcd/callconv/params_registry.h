@@ -3,37 +3,22 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__callconv_params_registry_h
 #define fcd__callconv_params_registry_h
 
-#include "llvm_warnings.h"
 #include "targetinfo.h"
 #include "pass_regaa.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/ADT/iterator_range.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/IR/Function.h>
 #include <llvm/Pass.h>
-#include "MemorySSA.h"
-SILENCE_LLVM_WARNINGS_END()
+#include <llvm/Transforms/Utils/MemorySSA.h>
 
 #include <cassert>
 #include <deque>
@@ -128,6 +113,11 @@ public:
 	iterator return_begin() { return values.begin() + returnBegin; }
 	const_iterator return_begin() const { return values.begin() + returnBegin; }
 	
+	iterator param_begin() { return begin(); }
+	const_iterator param_begin() const { return begin(); }
+	iterator param_end() { return return_begin(); }
+	const_iterator param_end() const { return return_begin(); }
+	
 	llvm::iterator_range<iterator> parameters()
 	{
 		return llvm::make_range(values.begin(), return_begin());
@@ -161,8 +151,8 @@ public:
 	}
 	
 	void clear() { values.clear(); }
-	void setCallingConvention(CallingConvention* cc) { this->cc = cc; }
-	void setStage(Stage stage) { this->stage = stage; }
+	void setCallingConvention(CallingConvention* conv) { this->cc = conv; }
+	void setStage(Stage s) { this->stage = s; }
 	void setVararg(bool v = true) { this->vararg = v; }
 	
 	template<typename... T>
@@ -202,8 +192,8 @@ class ParameterRegistryAAResults : public llvm::AAResultBase<ParameterRegistryAA
 	std::unique_ptr<TargetInfo> targetInfo;
 	
 public:
-	ParameterRegistryAAResults(const llvm::TargetLibraryInfo& tli, std::unique_ptr<TargetInfo> targetInfo)
-	: AAResultBase(tli), targetInfo(move(targetInfo))
+	ParameterRegistryAAResults(std::unique_ptr<TargetInfo> targetInfo)
+	: targetInfo(move(targetInfo))
 	{
 	}
 	
@@ -230,7 +220,7 @@ class ParameterRegistry final : public llvm::ModulePass
 	std::unique_ptr<TargetInfo> targetInfo;
 	std::unique_ptr<ProgramMemoryAAResult> aaHack;
 	std::deque<CallingConvention*> ccChain;
-	std::unordered_map<const llvm::Function*, std::unique_ptr<llvm::MemorySSA>> mssas;
+	std::unordered_map<const llvm::Function*, std::pair<unsigned, std::unique_ptr<llvm::MemorySSA>>> mssas;
 	bool analyzing;
 	
 	void addCallingConvention(CallingConvention* cc)
@@ -241,6 +231,8 @@ class ParameterRegistry final : public llvm::ModulePass
 	
 	CallInformation* analyzeFunction(llvm::Function& fn);
 	void setupCCChain();
+	
+	std::unique_ptr<llvm::MemorySSA> createMemorySSA(llvm::Function& fn);
 	
 public:
 	static char ID;
@@ -263,12 +255,13 @@ public:
 	const ParameterRegistryAAResults& getAAResult() const { return *aaResults; }
 	
 	const CallInformation* getCallInfo(llvm::Function& function);
+	const CallInformation* getDefinitionCallInfo(llvm::Function& function);
 	std::unique_ptr<CallInformation> analyzeCallSite(llvm::CallSite callSite);
 	
 	llvm::MemorySSA* getMemorySSA(llvm::Function& function);
 	
 	virtual void getAnalysisUsage(llvm::AnalysisUsage& au) const override;
-	virtual const char* getPassName() const override;
+	virtual llvm::StringRef getPassName() const override;
 	virtual bool doInitialization(llvm::Module& module) override;
 	virtual bool runOnModule(llvm::Module& m) override;
 };

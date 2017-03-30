@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "statements.h"
@@ -24,147 +12,250 @@
 #include "visitor.h"
 #include "print.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Support/raw_os_ostream.h>
-SILENCE_LLVM_WARNINGS_END()
 
 using namespace llvm;
 using namespace std;
 
-void NoopStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
+StatementList::StatementList(Statement* parent, StatementList&& that)
+: StatementList(parent)
 {
-	llvm_unreachable("noop statements cannot have children");
-}
-
-void ExpressionStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
-{
-	llvm_unreachable("expression statements cannot have children");
-}
-
-Statement* SequenceStatement::replace(iterator iter, NOT_NULL(Statement) newStatement)
-{
-	if (*iter == newStatement)
+	first = that.first;
+	last = that.last;
+	that.first = nullptr;
+	that.last = nullptr;
+	
+	for (auto stmt = first; stmt != nullptr; stmt = stmt->next)
 	{
-		return nullptr;
+		stmt->list = this;
+	}
+}
+
+StatementList::StatementList(Statement* parent, initializer_list<Statement*> statements)
+: StatementList(parent)
+{
+	for (auto statement : statements)
+	{
+		insert(end(), statement);
+	}
+}
+
+Statement* StatementList::pop_front()
+{
+	Statement* result = first;
+	first = first->next;
+	(first == nullptr ? last : first->previous) = nullptr;
+	
+	result->list = nullptr;
+	result->previous = nullptr;
+	result->next = nullptr;
+	return result;
+}
+
+Statement* StatementList::pop_back()
+{
+	Statement* result = last;
+	last = last->previous;
+	(last == nullptr ? first : last->next) = nullptr;
+	
+	result->list = nullptr;
+	result->previous = nullptr;
+	result->next = nullptr;
+	return result;
+}
+
+StatementList& StatementList::operator=(StatementList&& that)
+{
+	auto oldFirst = first;
+	
+	first = that.first;
+	last = that.last;
+	that.first = nullptr;
+	that.last = nullptr;
+	
+	for (auto stmt = first; stmt != nullptr; stmt = stmt->next)
+	{
+		stmt->list = this;
 	}
 	
-	Statement* old = *iter;
-	disown(old);
-	*iter = newStatement;
-	takeChild(newStatement);
-	return old;
+	for (auto stmt = oldFirst; stmt != nullptr; stmt = stmt->next)
+	{
+		stmt->dropAllReferences();
+		stmt->list = nullptr;
+		stmt->previous = nullptr;
+		stmt->next = nullptr;
+	}
+	
+	return *this;
 }
 
-void SequenceStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
+void StatementList::insert(NOT_NULL(Statement) location, NOT_NULL(Statement) statement)
 {
-	for (auto iter = statements.begin(); iter != statements.end(); ++iter)
+	location->list->insert(iterator(location), statement);
+}
+
+void StatementList::insert(NOT_NULL(Statement) location, StatementList&& list)
+{
+	location->list->insert(iterator(location), move(list));
+}
+
+void StatementList::insert(iterator iter, NOT_NULL(Statement) statement)
+{
+	assert(statement->list == nullptr);
+	Statement* next = *iter;
+	
+	if (next == nullptr)
 	{
-		if (*iter == child)
+		// insert at end
+		if (last == nullptr)
 		{
-			replace(iter, newChild);
-			return;
+			first = statement;
 		}
+		else
+		{
+			statement->previous = last;
+			last->next = statement;
+		}
+		last = statement;
 	}
-	llvm_unreachable("child not found in sequence statement");
-}
-
-void SequenceStatement::pushBack(NOT_NULL(Statement) statement)
-{
-	takeChild(statement);
-	statements.push_back(statement);
-}
-
-void SequenceStatement::takeAllFrom(SequenceStatement &sequence)
-{
-	for (Statement* statement : sequence)
+	else if (Statement* prev = next->previous)
 	{
-		sequence.disown(statement);
-		takeChild(statement);
-		statements.push_back(statement);
+		prev->next = statement;
+		next->previous = statement;
+		statement->previous = prev;
+		statement->next = next;
 	}
-	sequence.statements.clear();
-}
-
-void IfElseStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
-{
-	if (child == ifBody)
+	else
 	{
-		setIfBody(newChild);
-		return;
-	}
-	if (child == elseBody)
-	{
-		setElseBody(newChild);
-		return;
-	}
-	llvm_unreachable("child not found in if statement");
-}
-
-Statement* IfElseStatement::setIfBody(NOT_NULL(Statement) statement)
-{
-	Statement* old = ifBody;
-	if (old == statement)
-	{
-		return nullptr;
+		// insert at beginning
+		first->previous = statement;
+		statement->next = first;
+		first = statement;
 	}
 	
-	if (old != nullptr)
-	{
-		disown(old);
-	}
-	ifBody = statement;
-	takeChild(ifBody);
-	return old;
+	statement->list = this;
 }
 
-Statement* IfElseStatement::setElseBody(Statement *statement)
+void StatementList::insert(iterator iter, StatementList &&that)
 {
-	Statement* old = elseBody;
-	if (old == statement)
+	while (!that.empty())
 	{
-		return nullptr;
+		Statement* first = that.front();
+		erase(first);
+		insert(iter, first);
 	}
+}
+
+void StatementList::push_front(NOT_NULL(Statement) statement)
+{
+	assert(statement->list == nullptr && statement->previous == nullptr && statement->next == nullptr);
 	
-	if (old != nullptr)
+	statement->list = this;
+	if (first == nullptr)
 	{
-		disown(old);
+		last = statement;
 	}
-	elseBody = statement;
-	if (elseBody != nullptr)
+	else
 	{
-		takeChild(elseBody);
+		first->previous = statement;
+		statement->next = first;
 	}
-	return old;
+	first = statement;
 }
 
-void LoopStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
+void StatementList::push_front(StatementList&& that)
 {
-	if (child == loopBody)
+	assert(this != &that);
+	while (!that.empty())
 	{
-		setLoopBody(newChild);
-		return;
+		push_front(that.pop_back());
 	}
-	llvm_unreachable("child not found in loop statement");
 }
 
-Statement* LoopStatement::setLoopBody(NOT_NULL(Statement) statement)
+void StatementList::push_back(NOT_NULL(Statement) statement)
 {
-	Statement* old = loopBody;
-	if (old == statement)
-	{
-		return nullptr;
-	}
+	assert(statement->list == nullptr && statement->previous == nullptr && statement->next == nullptr);
 	
-	if (old != nullptr)
+	statement->list = this;
+	if (last == nullptr)
 	{
-		disown(old);
+		first = statement;
 	}
-	loopBody = statement;
-	takeChild(loopBody);
-	return old;
+	else
+	{
+		last->next = statement;
+		statement->previous = last;
+	}
+	last = statement;
 }
 
-void KeywordStatement::replaceChild(NOT_NULL(Statement) child, NOT_NULL(Statement) newChild)
+void StatementList::push_back(StatementList&& that)
 {
-	llvm_unreachable("keyword statements cannot have children");
+	assert(this != &that);
+	while (!that.empty())
+	{
+		push_back(that.pop_front());
+	}
+}
+
+void StatementList::erase(NOT_NULL(Statement) statement)
+{
+	if (statement->list != nullptr)
+	{
+		(void) statement->list->erase(iterator(statement));
+	}
+}
+
+StatementList::iterator StatementList::erase(iterator iter)
+{
+	Statement* target = *iter;
+	assert(target->list == this);
+	
+	Statement* oldPrev = target->previous;
+	Statement* oldNext = target->next;
+	(oldPrev == nullptr ? first : oldPrev->next) = target->next;
+	(oldNext == nullptr ? last : oldNext->previous) = target->previous;
+	target->list = nullptr;
+	target->previous = nullptr;
+	target->next = nullptr;
+	
+	return iterator(oldNext);
+}
+
+void StatementList::clear()
+{
+	auto iter = first;
+	while (auto statement = iter)
+	{
+		iter = statement->next;
+		statement->dropAllReferences();
+		statement->previous = nullptr;
+		statement->next = nullptr;
+		statement->list = nullptr;
+	}
+	first = nullptr;
+	last = nullptr;
+}
+
+void StatementList::print(raw_ostream& os) const
+{
+	DumbAllocator pool;
+	AstContext context(pool);
+	StatementPrintVisitor::print(context, os, *this, false);
+}
+
+void StatementList::dump() const
+{
+	print(errs());
+}
+
+void IfElseStatement::dropAllStatementReferences()
+{
+	ifBody.clear();
+	elseBody.clear();
+}
+
+void LoopStatement::dropAllStatementReferences()
+{
+	loopBody.clear();
 }

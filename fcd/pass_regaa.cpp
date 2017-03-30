@@ -3,39 +3,24 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 // This file is borrowed and recycled from a patch from Justin Holewinski that
 // never made it to the main repository.
 // http://lists.cs.uiuc.edu/pipermail/llvm-commits/Week-of-Mon-20111010/129632.html
 
-#include "llvm_warnings.h"
 #include "metadata.h"
 #include "passes.h"
 #include "pass_regaa.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/Passes.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-SILENCE_LLVM_WARNINGS_END()
 
 #include <memory>
 
@@ -88,8 +73,7 @@ const ProgramMemoryAAResult& ProgramMemoryAAWrapperPass::getResult() const
 
 bool ProgramMemoryAAWrapperPass::doInitialization(Module& m)
 {
-	auto& tli = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
-	result.reset(new ProgramMemoryAAResult(tli));
+	result.reset(new ProgramMemoryAAResult);
 	return false;
 }
 

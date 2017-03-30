@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 // About the x86_64 SystemV calling convention:
@@ -38,10 +26,8 @@
 #include "metadata.h"
 #include "x86_64_systemv.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/PatternMatch.h>
-#include "MemorySSA.h"
-SILENCE_LLVM_WARNINGS_END()
+#include <llvm/Transforms/Utils/MemorySSA.h>
 
 #include <unordered_map>
 
@@ -98,7 +84,7 @@ namespace
 				{
 					(info.*addParam)(ValueInformation(ValueInformation::Stack, *spOffset));
 					*spOffset += 8;
-					bitSize -= 64;
+					bitSize -= min<unsigned>(bitSize, 64);
 				}
 			}
 			return bitSize == 0;
@@ -121,18 +107,21 @@ namespace
 				// too hard, give up
 				break;
 			}
-			else if (isa<CallInst>(access->getMemoryInst()))
+			
+			auto useOrDef = cast<MemoryUseOrDef>(access);
+			Instruction* memoryInst = useOrDef->getMemoryInst();
+			if (isa<CallInst>(memoryInst))
 			{
 				break;
 			}
 			
-			auto def = cast<MemoryDef>(access);
+			auto def = cast<MemoryDef>(useOrDef);
 			// TODO: this check is only *almost* good. The right thing to do would be to make sure that the only
 			// accesses reaching from this def are other defs (with a call ending the chain). However, just checking
 			// that there is a single use is much faster, and probably good enough.
-			if (def->user_size() == 1)
+			if (def->hasOneUse())
 			{
-				if (auto store = dyn_cast<StoreInst>(def->getMemoryInst()))
+				if (auto store = dyn_cast<StoreInst>(memoryInst))
 				{
 					auto& pointer = *store->getPointerOperand();
 					if (const TargetRegisterInfo* info = target.registerInfo(pointer))
@@ -194,21 +183,21 @@ namespace
 				}
 			}
 			
-			access = access->getDefiningAccess();
+			access = useOrDef->getDefiningAccess();
 		}
 	}
 	
 	void identifyReturnCandidates(TargetInfo& target, MemorySSA& mssa, MemoryAccess* access, CallInformation& fillOut)
 	{
-		for (MemoryAccess* user : access->users())
+		for (User* user : access->users())
 		{
-			if (isa<MemoryPhi>(user))
+			if (auto memPhi = dyn_cast<MemoryPhi>(user))
 			{
-				identifyReturnCandidates(target, mssa, user, fillOut);
+				identifyReturnCandidates(target, mssa, memPhi, fillOut);
 			}
-			else if (isa<MemoryUse>(user))
+			else if (auto memUse = dyn_cast<MemoryUse>(user))
 			{
-				if (auto load = dyn_cast<LoadInst>(user->getMemoryInst()))
+				if (auto load = dyn_cast<LoadInst>(memUse->getMemoryInst()))
 				if (const TargetRegisterInfo* info = target.registerInfo(*load->getPointerOperand()))
 				if (isReturnRegister(*info))
 				{
@@ -245,10 +234,17 @@ const char* CallingConvention_x86_64_systemv::getHelp() const
 
 bool CallingConvention_x86_64_systemv::matches(TargetInfo &target, Executable &executable) const
 {
-	const char arch[] = "x86";
-	const char exe[] = "ELF 64";
-	return strncmp(target.targetName().c_str(), arch, sizeof arch - 1) == 0
-		&& strncmp(executable.getExecutableType().c_str(), exe, sizeof exe - 1) == 0;
+	string triple = executable.getTargetTriple();
+	string::size_type firstDash = triple.find('-');
+	string::size_type secondDash = triple.find('-', firstDash + 1);
+	string::size_type nextDash = triple.find('-', secondDash + 1);
+	string arch = triple.substr(0, firstDash);
+	string os = triple.substr(secondDash + 1, nextDash);
+	if (arch.compare(0, 3, "x86") == 0)
+	{
+		return os.compare(0, 6, "macosx") == 0 || executable.getExecutableType().compare(0, 3, "ELF") == 0;
+	}
+	return false;
 }
 
 const char* CallingConvention_x86_64_systemv::getName() const
@@ -274,9 +270,10 @@ bool CallingConvention_x86_64_systemv::analyzeFunction(ParameterRegistry &regist
 	// Identify register GEPs.
 	// (assume x86 regs as first parameter)
 	assert(function.arg_size() == 1);
-	auto regs = static_cast<Argument*>(function.arg_begin());
+	auto regs = function.arg_begin();
 	auto pointerType = dyn_cast<PointerType>(regs->getType());
-	assert(pointerType != nullptr && pointerType->getTypeAtIndex(int(0))->getStructName() == "struct.x86_regs");
+	assert(pointerType != nullptr && pointerType->getElementType()->getStructName() == "struct.x86_regs");
+	(void) pointerType;
 	
 	unordered_multimap<const TargetRegisterInfo*, GetElementPtrInst*> geps;
 	for (auto& use : regs->uses())
@@ -293,8 +290,8 @@ bool CallingConvention_x86_64_systemv::analyzeFunction(ParameterRegistry &regist
 	for (const char* name : parameterRegisters)
 	{
 		const TargetRegisterInfo* smallReg = targetInfo.registerNamed(name);
-		const TargetRegisterInfo* regInfo = targetInfo.largestOverlappingRegister(*smallReg);
-		auto range = geps.equal_range(regInfo);
+		const TargetRegisterInfo& regInfo = targetInfo.largestOverlappingRegister(*smallReg);
+		auto range = geps.equal_range(&regInfo);
 		
 		vector<Instruction*> addresses;
 		for (auto iter = range.first; iter != range.second; ++iter)
@@ -309,11 +306,11 @@ bool CallingConvention_x86_64_systemv::analyzeFunction(ParameterRegistry &regist
 			{
 				if (auto load = dyn_cast<LoadInst>(use.getUser()))
 				{
-					MemoryAccess* parent = mssa.getMemoryAccess(load)->getDefiningAccess();
+					MemoryAccess* parent = cast<MemoryUse>(mssa.getMemoryAccess(load))->getDefiningAccess();
 					if (mssa.isLiveOnEntryDef(parent))
 					{
 						// register argument!
-						callInfo.addParameter(ValueInformation::IntegerRegister, regInfo);
+						callInfo.addParameter(ValueInformation::IntegerRegister, &regInfo);
 					}
 				}
 				else if (auto cast = dyn_cast<CastInst>(use.getUser()))
@@ -344,7 +341,7 @@ bool CallingConvention_x86_64_systemv::analyzeFunction(ParameterRegistry &regist
 					ConstantInt* offset = nullptr;
 					if (match(use.get(), m_Add(m_Value(), m_ConstantInt(offset))))
 					{
-						make_signed<decltype(offset->getLimitedValue())>::type intOffset = offset->getLimitedValue();
+						auto intOffset = static_cast<int64_t>(offset->getLimitedValue());
 						if (intOffset > 8)
 						{
 							// memory argument!
@@ -420,7 +417,7 @@ bool CallingConvention_x86_64_systemv::analyzeCallSite(ParameterRegistry &regist
 	Instruction& inst = *cs.getInstruction();
 	Function& caller = *inst.getParent()->getParent();
 	MemorySSA& mssa = *registry.getMemorySSA(caller);
-	MemoryAccess* thisDef = mssa.getMemoryAccess(&inst);
+	MemoryDef* thisDef = cast<MemoryDef>(mssa.getMemoryAccess(&inst));
 	
 	identifyParameterCandidates(targetInfo, mssa, thisDef->getDefiningAccess(), fillOut);
 	identifyReturnCandidates(targetInfo, mssa, thisDef, fillOut);

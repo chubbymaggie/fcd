@@ -3,23 +3,17 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd. fcd as a whole is licensed under the terms
-// of the GNU GPLv3 license, but specific parts (such as this one) are
-// dual-licensed under the terms of a BSD-like license as well. You
-// may use, modify and distribute this part of fcd under the terms of
-// either license, at your choice.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #ifndef fcd__not_null_h
 #define fcd__not_null_h
 
-#include "llvm_warnings.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/Support/Casting.h>
-SILENCE_LLVM_WARNINGS_END()
 
-#ifdef DEBUG
+#ifdef FCD_DEBUG
 
 // Smart pointer class to enforce that the pointer isn't null, and yell loudly if it is.
 template<typename T>
@@ -44,10 +38,10 @@ struct NotNull
 		return *this;
 	}
 	
-	NotNull<T>& operator=(T* ptr)
+	NotNull<T>& operator=(T* p)
 	{
-		assert(ptr);
-		this->ptr = ptr;
+		assert(p);
+		this->ptr = p;
 		return *this;
 	}
 	
@@ -64,13 +58,6 @@ struct NotNull
 	operator T*() const
 	{
 		return ptr;
-	}
-	
-private:
-	// DumbAllocator is allowed to use the default constructor, which creates a null.
-	// This is so that it can create an array for PooledDeque.
-	NotNull() : ptr(nullptr)
-	{
 	}
 };
 

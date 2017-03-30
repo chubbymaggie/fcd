@@ -3,20 +3,8 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "call_conv.h"
@@ -66,12 +54,12 @@ namespace
 					
 					if (!alreadyFound)
 					{
-						const TargetRegisterInfo* registerInfo = targetInfo.largestOverlappingRegister(*maybeReg);
-						auto iter = find(returns.begin(), returns.end(), registerInfo);
+						const TargetRegisterInfo& registerInfo = targetInfo.largestOverlappingRegister(*maybeReg);
+						auto iter = find(returns.begin(), returns.end(), &registerInfo);
 						if (iter != returns.end())
 						{
 							// return value!
-							result.push_back(registerInfo);
+							result.push_back(&registerInfo);
 						}
 					}
 				}
@@ -105,9 +93,10 @@ vector<const TargetRegisterInfo*> ipaFindUsedReturns(ParameterRegistry& registry
 				continue;
 			}
 			
-			auto parentArgs = static_cast<Argument*>(parentFunction->arg_begin());
+			auto parentArgs = &*parentFunction->arg_begin();
 			auto pointerType = dyn_cast<PointerType>(parentArgs->getType());
-			assert(pointerType != nullptr && pointerType->getTypeAtIndex(int(0))->getStructName() == "struct.x86_regs");
+			assert(pointerType != nullptr && pointerType->getElementType()->getStructName() == "struct.x86_regs");
+			(void) pointerType;
 			
 			visited.clear();
 			MemorySSA& mssa = *registry.getMemorySSA(*parentFunction);

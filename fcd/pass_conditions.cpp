@@ -3,28 +3,14 @@
 // Copyright (C) 2015 Félix Cloutier.
 // All Rights Reserved.
 //
-// This file is part of fcd.
-// 
-// fcd is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// fcd is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// 
-// You should have received a copy of the GNU General Public License
-// along with fcd.  If not, see <http://www.gnu.org/licenses/>.
+// This file is distributed under the University of Illinois Open Source
+// license. See LICENSE.md for details.
 //
 
 #include "passes.h"
 
-SILENCE_LLVM_WARNINGS_BEGIN()
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/PatternMatch.h>
-SILENCE_LLVM_WARNINGS_END()
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -32,72 +18,145 @@ using namespace std;
 
 namespace
 {
-	Value* matchGetSignFlag(Value& value)
+	Value* getOriginalValue(Value& value)
 	{
 		Value* from = &value;
 		while (auto asCast = dyn_cast<CastInst>(from))
 		{
 			from = asCast->getOperand(0);
 		}
-		
-		Value* operand = nullptr;
-		ConstantInt* shiftAmount = nullptr;
-		if (match(from, m_LShr(m_Value(operand), m_ConstantInt(shiftAmount))))
-		if (operand->getType()->getIntegerBitWidth() == shiftAmount->getLimitedValue() + 1)
-		{
-			return operand;
-		}
-		return nullptr;
+		return from;
 	}
 	
-	bool isXorSub(BinaryOperator& xorInst, Value*& left, Value*& right)
+	bool isSameLowerBits(Value* a, Value* b)
 	{
-		Value* xorOp = nullptr;
-		auto sub = m_Sub(m_Value(left), m_Value(right));
-		if (match(&xorInst, m_Xor(m_Value(xorOp), sub)) && xorOp == left)
+		return getOriginalValue(*a) == getOriginalValue(*b);
+	}
+	
+	struct Subtraction
+	{
+		Value* left;
+		Value* right;
+		unsigned bitness;
+		
+		Subtraction(Value* left, Value* right, unsigned bitness)
+		: left(left), right(right), bitness(bitness)
 		{
+		}
+		
+		bool isSame(Value* l, Value* r, unsigned b)
+		{
+			if (b == bitness)
+			{
+				return (isSameLowerBits(l, left) && isSameLowerBits(r, right))
+					|| (isSameLowerBits(r, left) && isSameLowerBits(l, right));
+			}
+			return false;
+		}
+	};
+	
+	bool isSameSub(unique_ptr<Subtraction>& sub, Value* a, Value* b, unsigned bitness)
+	{
+		if (sub)
+		{
+			return sub->isSame(a, b, bitness);
+		}
+		else
+		{
+			if (auto constant = dyn_cast<ConstantInt>(b))
+			{
+				// check if a is (v + constant) too because LLVM will do a lot of constant folding
+				Value* rootValue = nullptr;
+				ConstantInt* constantAdd = nullptr;
+				if (match(a, m_Add(m_Value(rootValue), m_ConstantInt(constantAdd))))
+				{
+					a = rootValue;
+					b = ConstantInt::get(rootValue->getType(), constant->getValue() - constantAdd->getValue());
+				}
+			}
+			sub.reset(new Subtraction(a, b, bitness));
 			return true;
 		}
-		return match(&xorInst, m_Xor(sub, m_Value(xorOp))) && xorOp == left;
 	}
 	
-	bool isOverflowTest(Value& value, Value*& a, Value*& b)
+	bool matchSignFlag(Value& value, unique_ptr<Subtraction>& sub)
 	{
-		// %0 = sub %a, %b
-		// %1 = xor %a, %b
-		// %2 = xor %a, %0
-		// %3 = and %1, %2
-		
-		auto xorOp = Instruction::Xor;
-		BinaryOperator* left = nullptr;
-		BinaryOperator* right = nullptr;
-		if (match(&value, m_And(m_BinOp(left), m_BinOp(right))) && left->getOpcode() == xorOp && right->getOpcode() == xorOp)
+		auto original = getOriginalValue(value);
+		Value* one = nullptr;
+		if (match(original, m_And(m_Value(original), m_Value(one))))
+		if (match(getOriginalValue(*one), m_ConstantInt<1>()))
 		{
-			Value* subLeft = nullptr;
-			Value* subRight = nullptr;
-			BinaryOperator* xorValues = nullptr;
-			if (isXorSub(*left, subLeft, subRight))
+			original = getOriginalValue(*original);
+		}
+		
+		Value* a = nullptr;
+		Value* b = nullptr;
+		Value* operand = nullptr;
+		ConstantInt* shiftAmount = nullptr;
+		if (match(original, m_LShr(m_Value(operand), m_ConstantInt(shiftAmount))))
+		{
+			auto bitness = static_cast<unsigned>(shiftAmount->getLimitedValue()) + 1;
+			if (match(operand, m_Sub(m_Value(a), m_Value(b))))
 			{
-				xorValues = right;
+				return isSameSub(sub, a, b, bitness);
 			}
-			else if (isXorSub(*right, subLeft, subRight))
+			else
 			{
-				xorValues = left;
-			}
-			
-			if (xorValues != nullptr)
-			{
-				auto op0 = xorValues->getOperand(0);
-				auto op1 = xorValues->getOperand(1);
-				if ((op0 == subLeft && op1 == subRight) || (op0 == subRight && op1 == subLeft))
+				ConstantInt* constantRight = nullptr;
+				if (match(operand, m_Add(m_Value(a), m_ConstantInt(constantRight))))
 				{
-					a = subLeft;
-					b = subRight;
-					return true;
+					Type* constantType = constantRight->getType();
+					Constant* negated = ConstantInt::get(constantType, -constantRight->getValue());
+					return isSameSub(sub, a, negated, constantType->getIntegerBitWidth());
 				}
 			}
 		}
+		else
+		{
+			ICmpInst::Predicate pred;
+			if (match(original, m_ICmp(pred, m_Sub(m_Value(a), m_Value(b)), m_Zero())) && pred == ICmpInst::ICMP_SLT)
+			{
+				return isSameSub(sub, a, b, a->getType()->getIntegerBitWidth());
+			}
+		}
 		return false;
+	}
+	
+	bool matchOverflowFlag(Value& value, unique_ptr<Subtraction>& sub)
+	{
+		auto original = getOriginalValue(value);
+		if (auto extract = dyn_cast<ExtractValueInst>(original))
+		if (auto intrin = dyn_cast<IntrinsicInst>(extract->getAggregateOperand()))
+		if (intrin->getIntrinsicID() == Intrinsic::ssub_with_overflow)
+		{
+			auto indices = extract->getIndices();
+			if (indices.size() == 1 && indices[0] == 1)
+			{
+				Value* a = intrin->getArgOperand(0);
+				return isSameSub(sub, a, intrin->getArgOperand(1), a->getType()->getIntegerBitWidth());
+			}
+		}
+		return false;
+	}
+	
+	unique_ptr<Subtraction> matchOverflowSignFlag(Value& xorLeft, Value& xorRight)
+	{
+		unique_ptr<Subtraction> sub;
+		if (matchOverflowFlag(xorLeft, sub))
+		{
+			if (matchSignFlag(xorRight, sub))
+			{
+				return sub;
+			}
+		}
+		else if (matchOverflowFlag(xorRight, sub))
+		{
+			if (matchSignFlag(xorLeft, sub))
+			{
+				return sub;
+			}
+		}
+		return nullptr;
 	}
 	
 	struct ConditionSimplification final : public FunctionPass
@@ -121,99 +180,82 @@ namespace
 		bool runOnBasicBlock(BasicBlock& bb)
 		{
 			bool result = false;
-			// Attempt to remove uses of usub_with_overflow by replacig its bool element with icmp ult.
 			for (auto& inst : bb)
 			{
-				auto opcode = inst.getOpcode();
-				if (opcode == Instruction::Call)
+				Value* arg0 = nullptr;
+				Value* arg1 = nullptr;
+				if (match(&inst, m_Intrinsic<Intrinsic::usub_with_overflow>(m_Value(arg0), m_Value(arg1))))
 				{
-					if (auto intrin = dyn_cast<IntrinsicInst>(&inst))
-					if (intrin->getIntrinsicID() == Intrinsic::usub_with_overflow)
+					for (auto user : inst.users())
 					{
-						result |= replaceUsubWithOverflow(*intrin);
-					}
-				}
-				else if (opcode == Instruction::ICmp)
-				{
-					auto& icmp = cast<ICmpInst>(inst);
-					auto pred = icmp.getPredicate();
-					if (pred == ICmpInst::ICMP_EQ || pred == ICmpInst::ICMP_NE)
-					{
-						if (auto left = matchGetSignFlag(*icmp.getOperand(0)))
-						if (auto right = matchGetSignFlag(*icmp.getOperand(1)))
+						if (auto extract = dyn_cast<ExtractValueInst>(user))
 						{
-							Value* compareLeft = nullptr;
-							Value* compareRight = nullptr;
-							Value* testMatch = nullptr;
-							if (isOverflowTest(*left, compareLeft, compareRight))
+							auto indices = extract->getIndices();
+							if (indices.size() == 1 && indices[0] == 1)
 							{
-								testMatch = right;
-							}
-							else if (isOverflowTest(*right, compareLeft, compareRight))
-							{
-								testMatch = left;
-							}
-							
-							if (testMatch != nullptr && match(testMatch, m_Sub(m_Value(compareLeft), m_Value(compareRight))))
-							{
-								auto newPred = pred == ICmpInst::ICMP_EQ ? ICmpInst::ICMP_SGE : ICmpInst::ICMP_SLE;
-								auto newComp = ICmpInst::Create(Instruction::ICmp, newPred, compareLeft, compareRight, "", &icmp);
-								icmp.replaceAllUsesWith(newComp);
-								result = true;
+								auto icmp = ICmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_ULT, arg0, arg1, "", &inst);
+								extract->replaceAllUsesWith(icmp);
 							}
 						}
 					}
 				}
-				else if (opcode == Instruction::LShr)
+				else
 				{
-					if (auto signFlagOf = matchGetSignFlag(inst))
-					if (auto xorInst = dyn_cast<BinaryOperator>(signFlagOf))
-					if (xorInst->getOpcode() == Instruction::Xor)
+					Instruction* comparison = nullptr;
+					ICmpInst::Predicate pred;
+					if (match(&inst, m_Xor(m_Value(arg0), m_Value(arg1))))
 					{
-						auto left = xorInst->getOperand(0);
-						auto right = xorInst->getOperand(1);
-						
-						Value* compareLeft = nullptr;
-						Value* compareRight = nullptr;
-						Value* presumedSub = nullptr;
-						if (isOverflowTest(*left, compareLeft, compareRight))
+						if (unique_ptr<Subtraction> sub = matchOverflowSignFlag(*arg0, *arg1))
 						{
-							presumedSub = right;
-						}
-						else if (isOverflowTest(*right, compareLeft, compareRight))
-						{
-							presumedSub = left;
-						}
-						
-						if (presumedSub != nullptr && match(presumedSub, m_Sub(m_Value(compareLeft), m_Value(compareRight))))
-						{
-							auto icmp = ICmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_SLT, compareLeft, compareRight, "", &inst);
-							auto zext = new ZExtInst(icmp, inst.getType(), "", &inst);
-							inst.replaceAllUsesWith(zext);
-							result = true;
+							comparison = ICmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_SLT, sub->left, sub->right, "", &inst);
 						}
 					}
+					else if (match(&inst, m_ICmp(pred, m_Value(arg0), m_Value(arg1))))
+					{
+						if (pred == ICmpInst::ICMP_EQ || pred == ICmpInst::ICMP_NE)
+						if (unique_ptr<Subtraction> sub = matchOverflowSignFlag(*arg0, *arg1))
+						{
+							CmpInst::Predicate comparisonPred;
+							if (pred == ICmpInst::ICMP_NE)
+							{
+								comparisonPred = ICmpInst::ICMP_SLT;
+							}
+							else if (pred == ICmpInst::ICMP_EQ)
+							{
+								comparisonPred = ICmpInst::ICMP_SGE;
+							}
+							else
+							{
+								continue;
+							}
+							comparison = ICmpInst::Create(Instruction::ICmp, comparisonPred, sub->left, sub->right, "", &inst);
+						}
+					}
+					else
+					{
+						// For some time, LLVM has "simplified" instructions that are almost signed comparisons
+						// with zero into ((var >> 31) | (var == 0)). This tests against this very specific
+						// pattern.
+						uint64_t shiftAmount;
+						Value* shiftedValue;
+						Value* testedValue;
+						if (match(&inst, m_Or(m_LShr(m_Value(shiftedValue), m_ConstantInt(shiftAmount)), m_ZExt(m_ICmp(pred, m_Value(testedValue), m_ConstantInt<0>())))))
+						if (shiftedValue == testedValue)
+						if (shiftAmount == shiftedValue->getType()->getIntegerBitWidth() - 1)
+						{
+							auto zero = ConstantInt::get(shiftedValue->getType(), 0);
+							comparison = ICmpInst::Create(Instruction::ICmp, CmpInst::ICMP_SLE, shiftedValue, zero, "", &inst);
+						}
+					}
+					
+					if (comparison != nullptr)
+					{
+						Instruction* resultInst = inst.getType() != comparison->getType()
+							? (Instruction*)CastInst::Create(CastInst::ZExt, comparison, inst.getType(), "", &inst)
+							: (Instruction*)comparison;
+						inst.replaceAllUsesWith(resultInst);
+					}
 				}
-			}
-			return result;
-		}
-		
-		bool replaceUsubWithOverflow(IntrinsicInst& inst)
-		{
-			// This doesn't actually remove the usub_with_overflow, it merely replaces uses of its
-			// boolean return value.
-			bool result = false;
-			for (auto& use : inst.uses())
-			{
-				if (auto extract = dyn_cast<ExtractValueInst>(use.getUser()))
-				if (*extract->idx_begin() == 1)
-				{
-					assert(extract->getNumIndices() == 1);
-					auto icmp = ICmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_ULT, inst.getOperand(0), inst.getOperand(1), "", extract);
-					extract->replaceAllUsesWith(icmp);
-					result = true;
-				}
-				
 			}
 			return result;
 		}
@@ -221,10 +263,5 @@ namespace
 	
 	char ConditionSimplification::ID = 0;
 	
-	RegisterPass<ConditionSimplification> condSimp("simplifyconditions", "Simplify flag-based x86 conditionals");
-}
-
-FunctionPass* createConditionSimplificationPass()
-{
-	return new ConditionSimplification;
+	RegisterPass<ConditionSimplification> condSimp("simplifyconditions", "Simplify flag-based conditionals");
 }
